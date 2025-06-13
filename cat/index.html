@@ -3,8 +3,14 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta name="color-scheme" content="light">
   <title>🐱 Random Cat Generator</title>
   <style>
+    html {
+      color-scheme: light;
+      background: white;
+    }
+
     * {
       margin: 0;
       padding: 0;
@@ -25,7 +31,6 @@
       overflow-x: hidden;
     }
 
-    /* Floating background elements */
     body::before {
       content: '';
       position: fixed;
@@ -226,24 +231,22 @@
       75% { transform: translateX(5px); }
     }
 
-    /* Responsive design */
     @media (max-width: 768px) {
       .container {
         padding: 30px 20px;
         margin: 10px;
       }
-      
+
       h1 {
         font-size: 2rem;
       }
-      
+
       button {
         padding: 12px 24px;
         font-size: 14px;
       }
     }
 
-    /* Loading spinner */
     .spinner {
       border: 3px solid rgba(255, 255, 255, 0.2);
       border-top: 3px solid rgba(255, 255, 255, 0.8);
@@ -277,25 +280,23 @@
 
     async function loadCat() {
       if (isLoading) return;
-      
+
       isLoading = true;
       const catImg = document.getElementById("cat");
       const spinner = document.getElementById("spinner");
       const errorMsg = document.getElementById("error");
       const loadBtn = document.getElementById("loadBtn");
-      
-      // Show loading state
+
       catImg.classList.add('loading');
       spinner.style.display = 'block';
       errorMsg.style.display = 'none';
       loadBtn.disabled = true;
       loadBtn.textContent = 'Loading...';
-      
+
       try {
         const res = await fetch("https://cat-api-138397163137.asia-south1.run.app/cat");
         const data = await res.json();
-        
-        // Create new image to preload
+
         const newImg = new Image();
         newImg.onload = function() {
           catImg.src = this.src;
@@ -309,7 +310,7 @@
           throw new Error('Image failed to load');
         };
         newImg.src = data.url;
-        
+
       } catch (err) {
         console.error('Error loading cat:', err);
         catImg.classList.remove('loading');
@@ -318,18 +319,15 @@
         loadBtn.disabled = false;
         loadBtn.textContent = 'Try Again';
         isLoading = false;
-        
-        // Hide error message after 3 seconds
+
         setTimeout(() => {
           errorMsg.style.display = 'none';
         }, 3000);
       }
     }
 
-    // Load initial cat when page loads
     window.onload = loadCat;
 
-    // Add keyboard support
     document.addEventListener('keydown', function(e) {
       if (e.key === 'Enter' || e.key === ' ') {
         e.preventDefault();
