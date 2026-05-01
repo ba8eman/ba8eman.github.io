@@ -1,6 +1,4 @@
-# Johnson
-
-Personal website of Johnson.
+# Personal website of Johnson.
 
 Contains:
 
