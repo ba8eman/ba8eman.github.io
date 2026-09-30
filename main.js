@@ -828,8 +828,9 @@ const SKY_PRESETS = {
   },
 };
 
-// the cat's night glow: a soft white halo plus a small light that
-// brightens the grass around it as it wanders
+// the cat's night glow: a soft white halo that follows it around. (A real
+// point light here produced speckled, multicoloured noise on iPhone GPUs,
+// so the halo alone carries the glow on the grass.)
 const catHalo = new THREE.Sprite(
   new THREE.SpriteMaterial({
     map: makeGlowTexture(),
@@ -847,13 +848,10 @@ const catHalo = new THREE.Sprite(
 );
 catHalo.renderOrder = 1; // after the scene, so it simply adds light on top
 catHalo.position.y = 0.5;
-catHalo.scale.setScalar(2.2);
+catHalo.scale.setScalar(2.6);
 catHalo.visible = false;
 cat.add(catHalo);
 
-const catLight = new THREE.PointLight(0xffffff, 0, 3.5, 2);
-catLight.position.y = 0.7;
-cat.add(catLight);
 
 function clockSkyPhase() {
   const hour = new Date().getHours();
@@ -901,10 +899,9 @@ function setSkyValues(v) {
 
   for (const m of glowMaterials) m.emissiveIntensity = v.glow * 0.9;
   for (const m of cloudMaterials) m.emissiveIntensity = v.glow * 0.35;
-  cat.userData.whiteMat.emissiveIntensity = v.glow * 0.55;
-  catHalo.material.opacity = v.glow * 0.55;
+  cat.userData.whiteMat.emissiveIntensity = v.glow * 0.25; // lit, but still reads as a cat
+  catHalo.material.opacity = v.glow * 0.4;
   catHalo.visible = v.glow > 0.01;
-  catLight.intensity = v.glow * 0.7;
   fireflies.material.opacity = v.glow;
   fireflies.visible = v.glow > 0.01;
   stars.material.opacity = v.glow;
