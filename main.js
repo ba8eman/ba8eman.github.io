@@ -96,6 +96,7 @@ sun.shadow.camera.bottom = -18;
 sun.shadow.camera.near = 1;
 sun.shadow.camera.far = 40;
 sun.shadow.bias = -0.0025;
+sun.shadow.normalBias = 0.02; // stops speckled shadow acne, worst on mobile GPUs
 scene.add(sun);
 
 const fillLight = new THREE.DirectionalLight(0xffffff, 0.25);
@@ -836,10 +837,15 @@ const catHalo = new THREE.Sprite(
     transparent: true,
     opacity: 0,
     depthWrite: false,
+    // skip the depth test: the halo is a flat card that cuts through the
+    // grass, and on phones (lower depth precision) that intersection shows
+    // up as speckled "dirt" across the glow
+    depthTest: false,
     blending: THREE.AdditiveBlending,
     fog: false,
   })
 );
+catHalo.renderOrder = 1; // after the scene, so it simply adds light on top
 catHalo.position.y = 0.5;
 catHalo.scale.setScalar(2.2);
 catHalo.visible = false;
