@@ -584,18 +584,32 @@ catState.timer = 0.5;
 
 /* ------------------------------ fireflies ------------------------------ */
 
+// A soft round dot, shared by the fireflies, stars, comet and cat halo.
+// Built from raw pixels rather than a canvas gradient: Safari dithers canvas
+// gradients, and near the transparent edge that noise turns into bright
+// rainbow specks once the texture is stretched over something big. Here
+// every pixel is pure white and only the alpha fades, so nothing can tint it.
+let glowTexture = null;
 function makeGlowTexture() {
+  if (glowTexture) return glowTexture;
   const size = 64;
-  const c = document.createElement('canvas');
-  c.width = c.height = size;
-  const ctx = c.getContext('2d');
-  const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
-  g.addColorStop(0, 'rgba(255,255,255,1)');
-  g.addColorStop(0.25, 'rgba(255,255,255,0.8)');
-  g.addColorStop(1, 'rgba(255,255,255,0)');
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, size, size);
-  return new THREE.CanvasTexture(c);
+  const data = new Uint8Array(size * size * 4);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const d = Math.hypot(x + 0.5 - size / 2, y + 0.5 - size / 2) / (size / 2);
+      // bright core out to a quarter of the radius, then fade to nothing
+      const a = d < 0.25 ? 1 - 0.8 * d : Math.max(0, 0.8 * (1 - d) / 0.75);
+      const i = (y * size + x) * 4;
+      data[i] = data[i + 1] = data[i + 2] = 255;
+      data[i + 3] = Math.round(a * 255);
+    }
+  }
+  glowTexture = new THREE.DataTexture(data, size, size);
+  glowTexture.magFilter = THREE.LinearFilter;
+  glowTexture.minFilter = THREE.LinearMipmapLinearFilter;
+  glowTexture.generateMipmaps = true;
+  glowTexture.needsUpdate = true;
+  return glowTexture;
 }
 
 const FIREFLY_COUNT = 45;
