@@ -227,30 +227,32 @@ a.sign-label:hover {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Recreational — Kerala backwaters at sunset                         */
-/*  Same 3D-label machinery as the meadow, warmer palette.             */
+/*  Recreational — a moonlit beach with bioluminescent surf            */
+/*  Same 3D-label machinery as the meadow, dark glass and algae blue.  */
 /* ------------------------------------------------------------------ */
 
-body.backwaters {
-  background: #f8b26a;
+html:has(body.nightshore),
+body.nightshore {
+  background: #03060e;
 }
 
-body.backwaters #title,
-body.backwaters #hint {
-  color: #46261c;
+body.nightshore #title,
+body.nightshore #hint {
+  color: #dbe7ff;
 }
 
-body.backwaters #title {
-  text-shadow: 0 2px 6px rgba(255, 233, 199, 0.55);
+body.nightshore #title {
+  text-shadow: 0 2px 10px rgba(40, 150, 255, 0.35);
 }
 
-body.backwaters #hint {
-  background: rgba(255, 240, 220, 0.62);
+body.nightshore #hint {
+  background: rgba(10, 20, 44, 0.6);
+  box-shadow: inset 0 0 0 1px rgba(120, 200, 255, 0.14);
 }
 
-body.backwaters #loading {
-  background: linear-gradient(#f9c77f 0%, #f4884f 55%, #b5504f 100%);
-  color: #52281c;
+body.nightshore #loading {
+  background: radial-gradient(ellipse at 50% 120%, #0b3a66 0%, #061226 45%, #02050c 100%);
+  color: #bfe3ff;
 }
 
 #back-link {
@@ -261,22 +263,23 @@ body.backwaters #loading {
   font-size: 13px;
   font-weight: 700;
   letter-spacing: 0.2px;
-  color: #46261c;
-  background: rgba(255, 243, 226, 0.8);
+  color: #dbe7ff;
+  background: rgba(10, 20, 44, 0.65);
   padding: 8px 16px;
   border-radius: 999px;
   text-decoration: none;
-  box-shadow: 0 4px 12px rgba(90, 44, 26, 0.22);
+  box-shadow: inset 0 0 0 1px rgba(120, 200, 255, 0.18), 0 4px 14px rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(4px);
   transition: transform 0.2s ease, background 0.2s ease;
 }
 
 #back-link:hover {
   transform: translateX(-3px);
-  background: #fffaf2;
+  background: rgba(18, 36, 72, 0.8);
 }
 
-/* riverbank project plaques — a warm, weathered-wood take on .sign-label */
-.sign-label.bank {
+/* driftwood plaques — dark glass, edged in algae blue */
+.sign-label.shore {
   display: flex;
   flex-direction: column;
   gap: 3px;
@@ -284,57 +287,56 @@ body.backwaters #loading {
   white-space: normal;
   max-width: 190px;
   padding: 9px 15px;
-  color: #43231a;
-  background: rgba(255, 246, 232, 0.93);
-  border-left: 4px solid #c9682f;
+  color: #e4efff;
+  background: rgba(8, 18, 40, 0.78);
+  border-left: 3px solid #36b4ff;
   border-radius: 6px 14px 14px 6px;
-  box-shadow: 0 6px 16px rgba(78, 37, 22, 0.28);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45), 0 0 14px rgba(40, 160, 255, 0.18);
+  backdrop-filter: blur(3px);
 }
 
-a.sign-label.bank:hover {
+a.sign-label.shore:hover {
   transform: scale(1.06);
-  background: #fffdf8;
-  box-shadow: 0 9px 22px rgba(78, 37, 22, 0.34);
+  background: rgba(14, 30, 62, 0.9);
+  box-shadow: 0 9px 22px rgba(0, 0, 0, 0.5), 0 0 22px rgba(40, 160, 255, 0.35);
 }
 
-.sign-label.bank .bank-name {
+.sign-label.shore .shore-name {
   font-size: 14px;
   font-weight: 800;
   letter-spacing: 0.2px;
-  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.7);
 }
 
-.sign-label.bank .bank-note {
+.sign-label.shore .shore-note {
   font-size: 11px;
   font-weight: 600;
-  opacity: 0.72;
+  opacity: 0.68;
   line-height: 1.35;
 }
 
-.sign-label.bank.placeholder {
-  background: rgba(255, 246, 232, 0.88);
-  border-left-color: rgba(201, 104, 47, 0.5);
+.sign-label.shore.placeholder {
+  background: rgba(8, 18, 40, 0.62);
+  border-left: 3px dashed rgba(54, 180, 255, 0.55);
   border-top: 0;
   border-right: 0;
   border-bottom: 0;
-  color: #6b4032;
+  color: #b9c8e6;
   cursor: default;
 }
 
-/* the plaque the boat is currently passing gets lifted out of the row */
-.sign-label.bank.active {
-  background: #fffdf8;
-  border-left-color: #e0781f;
-  box-shadow: 0 10px 26px rgba(78, 37, 22, 0.36);
+/* the plaque the walker is currently passing lights up */
+.sign-label.shore.active {
+  border-left-color: #7fd6ff;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5), 0 0 26px rgba(60, 180, 255, 0.45);
 }
 
 @media (max-width: 640px) {
-  .sign-label.bank {
+  .sign-label.shore {
     max-width: 150px;
     padding: 7px 12px;
   }
-  .sign-label.bank .bank-name { font-size: 12.5px; }
-  .sign-label.bank .bank-note { display: none; }
+  .sign-label.shore .shore-name { font-size: 12.5px; }
+  .sign-label.shore .shore-note { display: none; }
   #back-link {
     top: 20px;
     right: 16px;
@@ -345,17 +347,17 @@ a.sign-label.bank:hover {
   #nav-bar button { width: 38px; height: 38px; }
 }
 
-/* the short fade that hides the loop back to the jetty */
+/* the short fade that hides the loop back to the start */
 #wrap-fade {
   position: fixed;
   inset: 0;
   z-index: 4;
   opacity: 0;
   pointer-events: none;
-  background: #ffd9a8;
+  background: #02050c;
 }
 
-/* drift controls */
+/* walk controls */
 #nav-bar {
   position: fixed;
   bottom: 54px;
@@ -374,18 +376,19 @@ a.sign-label.bank:hover {
   font: inherit;
   font-size: 17px;
   line-height: 1;
-  color: #46261c;
-  background: rgba(255, 243, 226, 0.82);
+  color: #dbe7ff;
+  background: rgba(10, 20, 44, 0.65);
   border: 0;
   border-radius: 50%;
   cursor: pointer;
-  box-shadow: 0 4px 12px rgba(90, 44, 26, 0.22);
+  box-shadow: inset 0 0 0 1px rgba(120, 200, 255, 0.18), 0 4px 12px rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(4px);
   transition: transform 0.18s ease, background 0.18s ease;
 }
 
 #nav-bar button:hover {
   transform: translateY(-2px);
-  background: #fffaf2;
+  background: rgba(18, 36, 72, 0.85);
 }
 
 #nav-bar button:active {

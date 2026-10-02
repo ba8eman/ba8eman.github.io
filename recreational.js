@@ -1,19 +1,25 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { makeCat, makeGlowTexture } from './cat.js';
 
 /* ------------------------------------------------------------------ */
-/*  Recreational — a Kerala backwater at sunset                        */
+/*  Recreational — a moonlit beach, glowing blue                       */
 /*                                                                     */
-/*  A kettuvallam poles itself slowly down a meandering channel while  */
-/*  the projects wait on the banks. Same hand-made low-poly vocabulary */
-/*  as the meadow next door, just lit by a setting sun instead.        */
+/*  The meadow's cat walks the waterline at night. Every wave that     */
+/*  breaks lights up with bioluminescent algae, the swash leaves a     */
+/*  fading blue sheen on the wet sand, and each paw sparks where it    */
+/*  lands. The projects wait on driftwood posts along the way.         */
 /* ------------------------------------------------------------------ */
 
 /* ----------------------------- the projects ----------------------------- */
 /* Swap these for the real thing — add a `url` to turn a plaque into a real
    link, leave it off and it stays a dashed placeholder. Order is the order
-   you drift past them. */
+   you walk past them. */
 
 const PROJECTS = [
   { name: 'Project 01', note: 'placeholder' },
@@ -26,104 +32,141 @@ const PROJECTS = [
   { name: 'Project 08', note: 'placeholder' },
 ];
 
-/* ------------------------------ the river ------------------------------ */
+/* ------------------------------ the shore ------------------------------ */
+/* The beach runs along Z. The sea is on +X, land on -X. `s` everywhere means
+   "distance up the beach from the mean waterline": negative is sea. */
 
-const RIVER_HALF = 5.2;      // half-width of open water
-const WATER_HALF = RIVER_HALF + 0.4;
-const GROUND_HALF = 34;      // half-width of the whole terrain slab
-const Z_START = 24;          // where the boat pushes off
-const Z_END = -104;          // where the trip loops — kept well short of the
-                             // world's edge so the river never visibly stops
+const Z_START = 20;           // where the walk begins
+const Z_END = -112;           // where it loops, behind a fade
 
-// The terrain runs a long way past the end of the trip. Everything between
-// Z_END and WORLD_END exists purely to be swallowed by haze, so the boat is
-// always sailing into more river rather than toward a horizon it can reach.
-const WORLD_START = 50;
-const WORLD_END = -200;
-const WORLD_LEN = WORLD_START - WORLD_END;
-const WORLD_MID = (WORLD_START + WORLD_END) / 2;
-const SCATTER_END = WORLD_END + 8;   // scenery fills the fog too
+const SIGN_SPACING = 13;
+const SIGN_FIRST_Z = -6;
+const SIGN_S = 5.5;           // plaques stand this far up the sand
 
-const FOG_NEAR = 32;
-const FOG_FAR = 100;                 // the edge at WORLD_END sits well beyond this
+const WALK_S = 1.5;           // the cat keeps to the wet sand, where the swash reaches
 
-const SIGN_SPACING = 11.5;
-const SIGN_FIRST_Z = -8;
+// waves — shared between the shader and the JS that needs to know where the water is
+const PERIOD = 7.0;           // seconds between waves reaching the sand
+const CREST_GAP = 7.0;        // spacing of the breaking crests offshore
+const RUN_MIN = -1.6;         // how far the backwash draws down
+const RUN_PEAK = 0.32;        // fraction of a cycle spent rushing up the sand
+
+const MOON_DIR = new THREE.Vector3(0.6, 0.15, -1).normalize();
+const HORIZON = new THREE.Color(0.02, 0.045, 0.1);    // linear; also the fog
+const ZENITH = new THREE.Color(0.002, 0.005, 0.018);
+const MOON_COL = new THREE.Color(0.5, 0.58, 0.75);
+const FOG_DENSITY = 0.016;
 
 const clock = new THREE.Clock();
 
+function fract(x) {
+  return x - Math.floor(x);
+}
+
 function hash(x, y) {
-  const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123;
-  return s - Math.floor(s);
+  return fract(Math.sin(x * 127.1 + y * 311.7) * 43758.5453123);
 }
 
-// the channel wanders a little on its way to the sun
-function riverCenterX(z) {
-  return Math.sin(z * 0.045) * 3.1 + Math.sin(z * 0.019 + 1.3) * 1.7;
+function h1(x) {
+  return fract(Math.sin(x * 127.1) * 43758.5453);
 }
 
-// one continuous slab: a bowl carved below the waterline, banks rising either side
-function groundHeight(x, z) {
-  const d = Math.abs(x - riverCenterX(z));
-  const wob =
-    Math.sin(z * 0.17) * 0.2 +
-    Math.cos(x * 0.21 + z * 0.09) * 0.17 +
-    Math.sin((x + z) * 0.07) * 0.22;
+function n1(x) {
+  const i = Math.floor(x);
+  const f = x - i;
+  const u = f * f * (3 - 2 * f);
+  return h1(i) + (h1(i + 1) - h1(i)) * u;
+}
 
-  if (d < RIVER_HALF) {
-    const t = d / RIVER_HALF;
-    return -0.1 - 1.35 * (1 - t * t);
-  }
-  const up = (d - RIVER_HALF) * 0.62;
-  return -0.1 + Math.min(up, 4.2) + wob * Math.min(1, up * 0.8);
+function shoreX(z) {
+  return 4 + Math.sin(z * 0.04) * 2.5 + Math.sin(z * 0.013 + 1) * 3;
+}
+
+// gentle slope up from the water, then the dunes
+function sandH(s) {
+  return s * 0.075 + THREE.MathUtils.smoothstep(s, 16, 34) * 2.2;
+}
+
+function waveCycle(z, t) {
+  return t / PERIOD + z * 0.012 + Math.sin(z * 0.045) * 0.3;
+}
+
+// how far up the sand wave number k reaches at this stretch of beach
+function runMax(k, z) {
+  return 2.0 + 2.2 * n1(z * 0.09 + k * 7.31);
+}
+
+// a fast rush up, a slower slide back
+function runAt(p, rmax) {
+  const e = p < RUN_PEAK
+    ? Math.sin((p / RUN_PEAK) * Math.PI * 0.5)
+    : Math.cos(((p - RUN_PEAK) / (1 - RUN_PEAK)) * Math.PI * 0.5);
+  return RUN_MIN + (rmax - RUN_MIN) * e;
+}
+
+// lerp between angles the short way round — headings here sit right on the ±PI seam
+function lerpAngle(a, b, k) {
+  const d = Math.atan2(Math.sin(b - a), Math.cos(b - a));
+  return a + d * k;
+}
+
+function waterEdgeAt(z, t) {
+  const c = waveCycle(z, t);
+  return runAt(fract(c), runMax(Math.floor(c), z));
 }
 
 /* ------------------------------- scene ------------------------------- */
 
-const HORIZON = new THREE.Color(0xf4a262);
-
 const scene = new THREE.Scene();
-scene.fog = new THREE.Fog(HORIZON.getHex(), FOG_NEAR, FOG_FAR);
+scene.fog = new THREE.FogExp2(HORIZON.clone(), FOG_DENSITY);
 
-// Expressed in the BOAT'S OWN frame, not world space. The hull is modelled
-// facing +Z, so a camera trailing it sits at negative Z — get this sign wrong
-// and the rotation parks the camera downstream, looking back up the river.
-const CAM_OFFSET = new THREE.Vector3(-2.2, 1.75, -9.2);
-const CAM_LOOK_Y = 1.5;
+// Expressed in the CAT'S OWN frame: it is modelled facing +Z, so a
+// camera trailing behind sits at negative Z, and +X is the land side.
+const CAM_OFFSET = new THREE.Vector3(2.4, 2.4, -8.0);   // a few steps back and up from the cat
+const CAM_LOOK_Y = 0.8;
 const UP = new THREE.Vector3(0, 1, 0);
 
-function headingAt(z) {
-  return Math.atan2(riverCenterX(z - 2.5) - riverCenterX(z), -2.5);
+function walkPathAt(z) {
+  return new THREE.Vector3(shoreX(z) - WALK_S, sandH(WALK_S), z);
 }
 
-const camera = new THREE.PerspectiveCamera(48, window.innerWidth / window.innerHeight, 0.1, 500);
+function headingAt(z) {
+  return Math.atan2(shoreX(z - 1) - shoreX(z), -1);
+}
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 900);
 {
   const start = CAM_OFFSET.clone().applyAxisAngle(UP, headingAt(Z_START));
-  camera.position.set(
-    riverCenterX(Z_START) + start.x,
-    CAM_LOOK_Y + start.y,
-    Z_START + start.z
-  );
+  const p = walkPathAt(Z_START);
+  camera.position.set(p.x + start.x, p.y + CAM_LOOK_Y + start.y, p.z + start.z);
 }
 
 const canvas = document.getElementById('scene');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75));
 renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 0.92;
+renderer.toneMappingExposure = 0.95;
+
+// the glow is the whole point, so it gets a bloom pass
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.85, 0.5, 0.62);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
 
 const controls = new OrbitControls(camera, renderer.domElement);
-controls.target.set(riverCenterX(Z_START), CAM_LOOK_Y, Z_START);
+{
+  const p = walkPathAt(Z_START);
+  controls.target.set(p.x, p.y + CAM_LOOK_Y, p.z);
+}
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
-controls.minDistance = 5;
-controls.maxDistance = 26;
-controls.minPolarAngle = Math.PI * 0.16;
-controls.maxPolarAngle = Math.PI * 0.495;   // stay above the waterline
+controls.minDistance = 2;
+controls.maxDistance = 24;
+controls.minPolarAngle = Math.PI * 0.18;
+controls.maxPolarAngle = Math.PI * 0.49;   // stay above the sand
 controls.enablePan = false;
 
 let userInteracted = false;
@@ -141,43 +184,102 @@ labelRenderer.domElement.style.left = '0';
 labelRenderer.domElement.style.pointerEvents = 'none';
 document.body.appendChild(labelRenderer.domElement);
 
-/* -------------------------------- sky -------------------------------- */
-/* direction of the sun, as seen from anywhere — it is "at infinity", so both
-   the gradient and the disc are pinned to the camera and never grow */
+/* ------------------------------ shader bits ------------------------------ */
+/* The same wave maths as the JS above, so the sand, the sea and the cat
+   all agree on where the water is. */
 
-const SUN_DIR = new THREE.Vector3(0.05, 0.05, -1).normalize();
+const f = (x) => x.toFixed(5);
+
+const GLSL_COMMON = /* glsl */ `
+  uniform float uTime;
+
+  #define PERIOD ${f(PERIOD)}
+  #define CREST_GAP ${f(CREST_GAP)}
+  #define RUN_MIN ${f(RUN_MIN)}
+  #define RUN_PEAK ${f(RUN_PEAK)}
+  #define HALF_PI 1.5707963
+
+  float h1(float x) { return fract(sin(x * 127.1) * 43758.5453); }
+  float h2(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+  float n1(float x) {
+    float i = floor(x), fr = fract(x);
+    return mix(h1(i), h1(i + 1.0), fr * fr * (3.0 - 2.0 * fr));
+  }
+  float n2(vec2 p) {
+    vec2 i = floor(p), fr = fract(p);
+    vec2 u = fr * fr * (3.0 - 2.0 * fr);
+    return mix(mix(h2(i), h2(i + vec2(1, 0)), u.x),
+               mix(h2(i + vec2(0, 1)), h2(i + vec2(1, 1)), u.x), u.y);
+  }
+
+  float shoreX(float z) { return 4.0 + sin(z * 0.04) * 2.5 + sin(z * 0.013 + 1.0) * 3.0; }
+  float sandH(float s) { return s * 0.075 + smoothstep(16.0, 34.0, s) * 2.2; }
+  float waveCycle(float z) { return uTime / PERIOD + z * 0.012 + sin(z * 0.045) * 0.3; }
+  float runMax(float k, float z) { return 2.0 + 2.2 * n1(z * 0.09 + k * 7.31); }
+  float runAt(float p, float rmax) {
+    float e = p < RUN_PEAK
+      ? sin(p / RUN_PEAK * HALF_PI)
+      : cos((p - RUN_PEAK) / (1.0 - RUN_PEAK) * HALF_PI);
+    return RUN_MIN + (rmax - RUN_MIN) * e;
+  }
+`;
+
+/* -------------------------------- sky -------------------------------- */
 
 const skyMat = new THREE.ShaderMaterial({
   uniforms: {
-    topColor: { value: new THREE.Color(0x3d4f86) },
-    midColor: { value: new THREE.Color(0xe98a6a) },
-    bottomColor: { value: new THREE.Color(0xf9b877) },
-    glowColor: { value: new THREE.Color(0xffd79a) },
-    sunDir: { value: SUN_DIR.clone() },
+    uTime: { value: 0 },
+    uMoonDir: { value: MOON_DIR },
+    uMoonCol: { value: MOON_COL },
+    uHorizon: { value: HORIZON },
+    uZenith: { value: ZENITH },
   },
   vertexShader: /* glsl */ `
     varying vec3 vDir;
     void main() {
-      vDir = normalize(position);
+      vDir = position;
       gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
     }
   `,
   fragmentShader: /* glsl */ `
-    uniform vec3 topColor;
-    uniform vec3 midColor;
-    uniform vec3 bottomColor;
-    uniform vec3 glowColor;
-    uniform vec3 sunDir;
+    ${GLSL_COMMON}
+    uniform vec3 uMoonDir, uMoonCol, uHorizon, uZenith;
     varying vec3 vDir;
+
     void main() {
       vec3 d = normalize(vDir);
-      float h = d.y;
-      vec3 c = mix(midColor, topColor, clamp(h * 1.7, 0.0, 1.0));
-      c = mix(bottomColor, c, clamp((h + 0.04) / 0.22, 0.0, 1.0));
-      float a = max(dot(d, sunDir), 0.0);
-      c += glowColor * pow(a, 14.0) * 0.9;
-      c += glowColor * pow(a, 3.0) * 0.22;
-      gl_FragColor = vec4(c, 1.0);
+      float y = d.y;
+      vec3 col = mix(uHorizon, uZenith, smoothstep(0.0, 0.55, y));
+      if (y < 0.0) col = uHorizon;
+
+      float m = max(dot(d, uMoonDir), 0.0);
+
+      // stars, thinning toward the horizon and drowned out near the moon
+      if (y > 0.0) {
+        vec2 sp = vec2(atan(d.z, d.x), asin(y)) * 95.0;
+        vec2 id = floor(sp);
+        float h = h2(id);
+        if (h > 0.982) {
+          vec2 c = id + 0.5 + (vec2(h2(id + 7.1), h2(id + 3.3)) - 0.5) * 0.6;
+          float star = smoothstep(0.16, 0.0, length(sp - c));
+          float tw = 0.65 + 0.35 * sin(uTime * (1.0 + h * 3.0) + h * 60.0);
+          float bright = 0.4 + 2.2 * pow(h2(id + 1.7), 6.0);
+          col += vec3(0.8, 0.88, 1.0) * star * tw * bright
+               * smoothstep(0.02, 0.25, y) * (1.0 - smoothstep(0.93, 0.99, m));
+        }
+      }
+
+      // halo, then the disc itself
+      col += uMoonCol * (pow(m, 18.0) * 0.03 + pow(m, 400.0) * 0.16);
+      float disc = smoothstep(0.99905, 0.99925, m);
+      vec3 rel = (d - uMoonDir) * 70.0;
+      float maria = n2(rel.xy * 1.3 + 4.0) * 0.6 + n2(rel.yz * 2.7) * 0.4;
+      col = mix(col, vec3(0.72, 0.74, 0.72) * (0.72 + 0.28 * maria), disc);
+
+      // (no moon path painted below the horizon: the sea's own glitter fades
+      // out well before it, so a painted one floated as a detached dashed line)
+
+      gl_FragColor = vec4(col, 1.0);
     }
   `,
   side: THREE.BackSide,
@@ -185,232 +287,284 @@ const skyMat = new THREE.ShaderMaterial({
   fog: false,
 });
 
-const sky = new THREE.Mesh(new THREE.SphereGeometry(300, 32, 20), skyMat);
+const sky = new THREE.Mesh(new THREE.SphereGeometry(500, 48, 24), skyMat);
 sky.renderOrder = -1;
 scene.add(sky);
 
-// the sun itself: a flat disc plus a couple of additive haloes
-const sunGroup = new THREE.Group();
-sunGroup.renderOrder = 0;
-{
-  const disc = new THREE.Mesh(
-    new THREE.CircleGeometry(11, 48),
-    new THREE.MeshBasicMaterial({ color: 0xfff4cf, fog: false, depthWrite: false })
-  );
-  sunGroup.add(disc);
-
-  const haloes = [
-    { r: 17, c: 0xffd591, o: 0.3 },
-    { r: 27, c: 0xff9e63, o: 0.17 },
-    { r: 46, c: 0xff8452, o: 0.09 },
-  ];
-  for (const h of haloes) {
-    const glow = new THREE.Mesh(
-      new THREE.CircleGeometry(h.r, 40),
-      new THREE.MeshBasicMaterial({
-        color: h.c,
-        transparent: true,
-        opacity: h.o,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-        fog: false,
-      })
-    );
-    glow.position.z = -0.1 * h.r;
-    sunGroup.add(glow);
-  }
-}
-scene.add(sunGroup);
-
 /* ------------------------------- lights ------------------------------- */
 
-const hemi = new THREE.HemisphereLight(0xffcf9a, 0x2f4a3a, 0.75);
-scene.add(hemi);
+scene.add(new THREE.HemisphereLight(0x3a4c7a, 0x05070d, 0.55));
 
-// low, warm, raking light coming up the river from the sun
-const sun = new THREE.DirectionalLight(0xffc387, 1.55);
-sun.castShadow = true;
-sun.shadow.mapSize.set(1536, 1536);
-sun.shadow.camera.left = -17;
-sun.shadow.camera.right = 17;
-sun.shadow.camera.top = 17;
-sun.shadow.camera.bottom = -17;
-sun.shadow.camera.near = 1;
-sun.shadow.camera.far = 70;
-sun.shadow.bias = -0.0022;
-scene.add(sun);
-scene.add(sun.target);
+const moonLight = new THREE.DirectionalLight(0xa8bce6, 0.9);
+scene.add(moonLight);
+scene.add(moonLight.target);
 
-// cool bounce from the sky opposite the sun, so shadowed sides aren't dead
-const bounce = new THREE.DirectionalLight(0x8fb6e8, 0.4);
-bounce.position.set(-6, 7, 10);
-scene.add(bounce);
+// the algae lights the cat's paws from below
+const footGlow = new THREE.PointLight(0x2aa4ff, 1, 4, 2);
+scene.add(footGlow);
 
-/* ------------------------------- terrain ------------------------------- */
+/* -------------------------- sand and sea -------------------------- */
+/* One surface for both, so there is never a seam at the waterline. The
+   fragment shader decides, per pixel, whether it is looking at dry sand, wet
+   sand, a thin sheet of swash or open sea — and where the algae is lit. */
 
-function buildTerrain() {
-  const geo = new THREE.PlaneGeometry(GROUND_HALF * 2, WORLD_LEN, 84, 190);
-  geo.rotateX(-Math.PI / 2);
-  geo.translate(0, 0, WORLD_MID);
+const STEPS = 40;   // paw prints the shader remembers
+const stepUniforms = Array.from({ length: STEPS }, () => new THREE.Vector4(0, 0, -1000, 0));
 
-  const pos = geo.attributes.position;
-  const colors = new Float32Array(pos.count * 3);
+const BEACH_W = 170;
+const BEACH_L = 230;
+const BEACH_SEG_X = 255;
+const BEACH_SEG_Z = 345;
+const CELL_X = BEACH_W / BEACH_SEG_X;
+const CELL_Z = BEACH_L / BEACH_SEG_Z;
 
-  const silt = new THREE.Color(0x4a3f2a);      // riverbed
-  const mud = new THREE.Color(0x7c6a44);       // waterline
-  const grass = new THREE.Color(0x4f7a38);     // bank
-  const lush = new THREE.Color(0x35602f);      // deeper vegetation
-  const tmp = new THREE.Color();
+const beachGeo = new THREE.PlaneGeometry(BEACH_W, BEACH_L, BEACH_SEG_X, BEACH_SEG_Z);
+beachGeo.rotateX(-Math.PI / 2);
 
-  for (let i = 0; i < pos.count; i++) {
-    const x = pos.getX(i);
-    const z = pos.getZ(i);
-    const y = groundHeight(x, z);
-    pos.setY(i, y);
+const beachMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uTime: { value: 0 },
+    uMoonDir: { value: MOON_DIR },
+    uMoonCol: { value: MOON_COL },
+    uFogCol: { value: HORIZON },
+    uSkyCol: { value: new THREE.Color(0.03, 0.055, 0.11) },
+    uFogDensity: { value: FOG_DENSITY },
+    uSteps: { value: stepUniforms },
+    uCat: { value: new THREE.Vector2() },
+  },
+  vertexShader: /* glsl */ `
+    ${GLSL_COMMON}
+    varying vec3 vWorld;
+    varying float vS;
 
-    const mottle = hash(x * 1.9, z * 1.9);
-    if (y < -0.12) {
-      tmp.copy(mud).lerp(silt, Math.min(1, -y / 1.4));
-    } else {
-      tmp.copy(mud).lerp(grass, Math.min(1, (y + 0.1) / 0.8));
-      tmp.lerp(lush, Math.min(1, Math.max(0, (y - 0.5) / 2.6)));
-      tmp.lerp(new THREE.Color(0x6f9b45), mottle * 0.3);
+    // swell, peaking at each crest with a steep shoreward face
+    float seaY(float s, float z) {
+      float d = RUN_MIN - s;
+      float q = fract(waveCycle(z) + max(d, 0.0) / CREST_GAP);
+      float shape = max(exp(-q * 4.0), smoothstep(0.86, 1.0, q));
+      float amp = 0.05 + 0.34 * smoothstep(0.0, CREST_GAP * 0.8, d)
+                              * smoothstep(CREST_GAP * 5.0, CREST_GAP * 1.4, d);
+      float chop = sin(z * 0.31 + uTime * 0.9) * 0.04 + sin(s * 0.27 - uTime * 0.7) * 0.05;
+      return -0.1 + amp * shape + chop * smoothstep(0.0, 6.0, d);
     }
-    tmp.toArray(colors, i * 3);
-  }
 
-  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  geo.computeVertexNormals();
+    void main() {
+      vec4 w = modelMatrix * vec4(position, 1.0);
+      float s = shoreX(w.z) - w.x;
+      float y = sandH(s);
+      if (s < 1.0) y = max(y, seaY(s, w.z));
+      w.y = y;
+      vS = s;
+      vWorld = w.xyz;
+      gl_Position = projectionMatrix * viewMatrix * w;
+    }
+  `,
+  fragmentShader: /* glsl */ `
+    ${GLSL_COMMON}
+    #define STEPS ${STEPS}
+    uniform vec3 uMoonDir, uMoonCol, uFogCol, uSkyCol;
+    uniform float uFogDensity;
+    uniform vec4 uSteps[STEPS];   // x, z, time placed, unused
+    uniform vec2 uCat;
+    varying vec3 vWorld;
+    varying float vS;
 
-  const mesh = new THREE.Mesh(
-    geo,
-    new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 1 })
-  );
-  mesh.receiveShadow = true;
-  return mesh;
+    const vec3 BIO = vec3(0.03, 0.42, 1.0);
+    const vec3 BIO_HOT = vec3(0.12, 0.7, 1.0);
+
+    // scattered specks of algae, each twinkling on its own clock
+    float specks(vec2 xz, float scale, float density) {
+      vec2 g = xz * scale;
+      vec2 id = floor(g);
+      float h = h2(id);
+      vec2 jit = vec2(h2(id + 3.1), h2(id + 7.7)) - 0.5;
+      float d = length(fract(g) - 0.5 - jit * 0.6);
+      float tw = 0.55 + 0.45 * sin(uTime * (1.3 + h * 4.0) + h * 40.0);
+      return step(1.0 - density, h) * smoothstep(0.24, 0.0, d) * tw;
+    }
+
+    // small moving ripples, as a slope — enough to break the moon into a path
+    vec2 ripples(vec2 p) {
+      vec2 g = vec2(0.0);
+      g += vec2(0.8, 0.6)  * 0.9 * cos(dot(p, vec2(0.8, 0.6)) * 0.9 + uTime * 1.1) * 0.22;
+      g += vec2(-0.5, 0.9) * 1.7 * cos(dot(p, vec2(-0.5, 0.9)) * 1.7 + uTime * 1.6) * 0.12;
+      g += vec2(0.95, -0.3)* 3.1 * cos(dot(p, vec2(0.95, -0.3)) * 3.1 + uTime * 2.3) * 0.06;
+      g += vec2(0.2, 1.0)  * 5.3 * cos(dot(p, vec2(0.2, 1.0)) * 5.3 - uTime * 3.1) * 0.03;
+      float e = 0.07;
+      vec2 q = p * 2.2 + vec2(uTime * 0.4, -uTime * 0.3);
+      g += vec2(n2(q + vec2(e, 0)) - n2(q - vec2(e, 0)), n2(q + vec2(0, e)) - n2(q - vec2(0, e))) / (2.0 * e) * 0.08;
+      return g;
+    }
+
+    void main() {
+      float z = vWorld.z;
+      float s = vS;
+      vec3 toCam = cameraPosition - vWorld;
+      float dist = length(toCam);
+      vec3 V = toCam / dist;
+      vec3 geomN = normalize(cross(dFdx(vWorld), dFdy(vWorld)));
+      if (geomN.y < 0.0) geomN = -geomN;
+      float near = smoothstep(55.0, 12.0, dist);   // fade fine detail before it shimmers
+
+      // where is the water right now?
+      float c = waveCycle(z);
+      float k = floor(c);
+      float p = fract(c);
+      float rmax = runMax(k, z);
+      float R = runAt(p, rmax);
+      float covered = smoothstep(R + 0.06, R - 0.06, s);
+      float sheet = s < RUN_MIN ? 1.0 : clamp((R - s) / 1.6, 0.0, 1.0);
+
+      /* ---- sand ---- */
+      float grain = n2(vWorld.xz * 3.0) * 0.6 + n2(vWorld.xz * 23.0) * 0.4 * near;
+      float wetLine = 3.8 + n1(z * 0.07) * 0.7;
+      float wet = smoothstep(wetLine + 0.9, wetLine - 0.2, s);
+      vec3 albedo = vec3(0.6, 0.57, 0.53) * (0.82 + 0.3 * grain);
+      albedo *= mix(1.0, 0.45, wet);
+
+      // footprints press darker hollows into the sand
+      float pressed = 0.0;
+      float stepGlow = 0.0;
+      for (int i = 0; i < STEPS; i++) {
+        vec4 st = uSteps[i];
+        float age = uTime - st.z;
+        vec2 rel = vWorld.xz - st.xy;
+        float foot = smoothstep(0.085, 0.03, length(rel));
+        pressed = max(pressed, foot * exp(-age * 0.04));
+        float ring = exp(-abs(length(rel) - age * 0.55) * 16.0) * exp(-age * 1.6);
+        stepGlow += foot * exp(-age * 0.45) * 1.6 + ring * 0.7;
+      }
+      albedo *= 1.0 - pressed * 0.35;
+
+      vec2 bump = (vec2(n2(vWorld.xz * 6.0 + 0.5), n2(vWorld.xz * 6.0 + 9.1)) - 0.5) * 0.25 * near;
+      vec3 sandN = normalize(geomN + vec3(bump.x, 0.0, bump.y));
+      vec3 ambient = vec3(0.02, 0.03, 0.06);
+      vec3 sandCol = albedo * (uMoonCol * max(dot(sandN, uMoonDir), 0.0) * 0.38 + ambient);
+
+      // wet sand is a dull mirror
+      vec3 Rs = reflect(-V, sandN);
+      float wetSpec = pow(max(dot(Rs, uMoonDir), 0.0), 60.0) * 0.12;
+      sandCol += wet * (uMoonCol * wetSpec + uSkyCol * 0.15);
+
+      // the cat's shadow, thrown away from the moon
+      vec2 away = -normalize(uMoonDir.xz);
+      vec2 rel = vWorld.xz - uCat;
+      float along = clamp(dot(rel, away), 0.0, 1.8);
+      float across = length(rel - away * along);
+      float width = 0.24 * (1.0 - along / 1.8 * 0.3);
+      sandCol *= 1.0 - 0.5 * smoothstep(width + 0.12, width - 0.06, across) * (1.0 - along / 1.8 * 0.6);
+
+      /* ---- water ---- */
+      vec2 g = ripples(vWorld.xz) * mix(0.35, 1.0, smoothstep(RUN_MIN + 1.0, RUN_MIN - 3.0, s));
+      vec3 waterN = normalize(geomN + vec3(-g.x, 0.0, -g.y));
+      float fres = 0.02 + 0.98 * pow(1.0 - max(dot(waterN, V), 0.0), 5.0);
+      vec3 Rw = reflect(-V, waterN);
+      float md = max(dot(Rw, uMoonDir), 0.0);
+      float spec = pow(md, 2200.0) * 1.5 + pow(md, 220.0) * 0.02;
+      spec *= smoothstep(130.0, 75.0, dist);
+      vec3 waterCol = vec3(0.003, 0.008, 0.02) + uSkyCol * fres * 0.8 + uMoonCol * spec;
+
+      vec3 col = mix(sandCol, waterCol, covered * mix(0.45, 1.0, sheet));
+
+      /* ---- bioluminescence ---- */
+      float glow = 0.0;
+
+      // breaking crests coming in: a sharp lit line with churned foam behind it
+      float d = RUN_MIN - s;
+      if (d > 0.0) {
+        float cq = c + d / CREST_GAP;
+        float q = fract(cq);
+        float kq = floor(cq);
+        float crest = exp(-q * 26.0) * smoothstep(1.0, 0.985, q);
+        float churn = exp(-q * 5.0) * smoothstep(1.0, 0.97, q);
+        float streak = n2(vec2(z * 1.3, d * 2.2 - uTime * 0.6));
+        float breaking = smoothstep(CREST_GAP * 2.4, CREST_GAP * 0.35, d);
+        float patchy = 0.35 + 0.9 * smoothstep(0.25, 0.75, n2(vec2(z * 0.16, kq * 3.7)));
+        glow += breaking * patchy * (crest * 3.2 + churn * streak * streak * 1.5);
+        // the swell further out only catches a little
+        float far = (1.0 - breaking) * smoothstep(CREST_GAP * 6.0, CREST_GAP * 2.0, d);
+        glow += far * crest * 0.35 * n2(vec2(z * 0.4, kq));
+        // drifting plankton in open water
+        glow += specks(vWorld.xz + vec2(uTime * 0.05, 0.0), 2.5, 0.05) * 0.5 * near;
+      }
+
+      // the leading edge of the swash, brightest while it is still rushing up
+      float behindEdge = R - s;
+      if (behindEdge > 0.0) {
+        float rushing = p < RUN_PEAK ? 1.0 : 1.0 - smoothstep(RUN_PEAK, RUN_PEAK + 0.4, p) * 0.85;
+        float lace = 0.55 + 0.9 * n2(vec2(z * 1.1, k * 5.3 + uTime * 0.2));
+        glow += exp(-behindEdge * 5.0) * rushing * lace * 2.2;
+        // streaks of algae tumbling in the thin sheet behind it
+        float foam = n2(vec2(z * 1.6, s * 2.6 - p * 9.0));
+        glow += smoothstep(RUN_MIN - 1.0, RUN_MIN + 0.5, s) * (foam * foam * foam * 1.8 + 0.1) * (1.0 - p * 0.7);
+      }
+
+      // after the water drains away, the sand it touched keeps glowing for a bit
+      if (s > R) {
+        float after = 0.0;
+        if (p > RUN_PEAK && s < rmax) {
+          float pe = RUN_PEAK + (1.0 - RUN_PEAK) * acos(clamp((s - RUN_MIN) / (rmax - RUN_MIN), 0.0, 1.0)) / HALF_PI;
+          after = exp(-(p - pe) * PERIOD * 0.75);
+        }
+        float rprev = runMax(k - 1.0, z);
+        if (s < rprev) {
+          float pe = RUN_PEAK + (1.0 - RUN_PEAK) * acos(clamp((s - RUN_MIN) / (rprev - RUN_MIN), 0.0, 1.0)) / HALF_PI;
+          after = max(after, exp(-(p + 1.0 - pe) * PERIOD * 0.75));
+        }
+        float sp = mix(0.12, specks(vWorld.xz, 9.0, 0.45), near);
+        glow += after * (sp * 2.4 + 0.12);
+      }
+
+      // stranded algae: the wet sand is never fully dark, and a line of it marks the tide
+      float strand = mix(0.04, specks(vWorld.xz, 11.0, 0.3), near);
+      glow += wet * strand * 0.45;
+      glow += exp(-abs(s - wetLine) * 3.0) * mix(0.08, specks(vWorld.xz * vec2(1.0, 0.5), 14.0, 0.6), near) * 0.9;
+
+      // every paw print on wet sand lights up, and in the swash it flares
+      glow += stepGlow * wet * (0.6 + covered * 1.4) * (0.6 + 0.6 * specks(vWorld.xz, 16.0, 0.6));
+
+      vec3 bio = mix(BIO, BIO_HOT, smoothstep(1.2, 4.0, glow)) * glow * 0.75;
+
+      // fog: the glow cuts through the haze a little better than everything else
+      float fogF = exp(-pow(dist * uFogDensity, 2.0));
+      float fogGlow = exp(-pow(dist * uFogDensity * 0.7, 2.0));
+      col = mix(uFogCol, col, fogF) + bio * fogGlow;
+
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `,
+  fog: false,
+});
+
+const beach = new THREE.Mesh(beachGeo, beachMat);
+beach.frustumCulled = false;
+scene.add(beach);
+
+// the surface travels with the cat; snapping to the grid keeps the vertices
+// from swimming as it moves, and the shader works in world space throughout
+function placeBeach(z) {
+  const cx = shoreX(z) + 15;
+  const cz = z - 62;
+  beach.position.set(Math.round(cx / CELL_X) * CELL_X, 0, Math.round(cz / CELL_Z) * CELL_Z);
 }
 
-scene.add(buildTerrain());
+/* ------------------------------ distant land ------------------------------ */
 
-/* -------------------------------- water -------------------------------- */
-/* a grid strip bent to follow the meander. Y ripples and vertex brightness
-   are refreshed every frame; the base colour (depth + the sun's gold column)
-   is what gets modulated. */
-
-const WATER_SEG_X = 30;
-const WATER_SEG_Z = 180;
-
-const waterGeo = new THREE.PlaneGeometry(WATER_HALF * 2, WORLD_LEN, WATER_SEG_X, WATER_SEG_Z);
-waterGeo.rotateX(-Math.PI / 2);
-waterGeo.translate(0, 0, WORLD_MID);
-
-const waterPos = waterGeo.attributes.position;
-const waterCount = waterPos.count;
-const waterU = new Float32Array(waterCount);   // across-channel, -1..1
-const waterZ = new Float32Array(waterCount);
-const waterBase = new Float32Array(waterCount * 3);
-const waterColors = new Float32Array(waterCount * 3);
-
-{
-  const deep = new THREE.Color(0x1d4a55);
-  const shallow = new THREE.Color(0x3c7e72);
-  const tmp = new THREE.Color();
-
-  for (let i = 0; i < waterCount; i++) {
-    const x = waterPos.getX(i);
-    const z = waterPos.getZ(i);
-    waterU[i] = x / WATER_HALF;
-    waterZ[i] = z;
-
-    // bend the whole row sideways onto the channel centreline
-    waterPos.setX(i, x + riverCenterX(z));
-
-    const edge = Math.abs(waterU[i]);
-    tmp.copy(deep).lerp(shallow, Math.pow(edge, 2.2));
-    tmp.toArray(waterBase, i * 3);
-  }
-}
-
-waterGeo.setAttribute('color', new THREE.BufferAttribute(waterColors, 3));
-
-const water = new THREE.Mesh(
-  waterGeo,
-  new THREE.MeshStandardMaterial({
-    vertexColors: true,
-    flatShading: true,
-    roughness: 0.46,
-    metalness: 0.08,
-    // just sheer enough to see fish moving underneath
-    transparent: true,
-    opacity: 0.82,
-  })
-);
-water.receiveShadow = true;
-water.renderOrder = 1;   // before the wake and splash rings
-scene.add(water);
-
-const GOLD = new THREE.Color(0xf6b269);
-const EMBER = new THREE.Color(0xe8944e);
-
-const warmScratch = new THREE.Color();
-
-function updateWater(t, boatX, boatZ) {
-  const pos = waterGeo.attributes.position;
-  const col = waterGeo.attributes.color;
-
-  for (let i = 0; i < waterCount; i++) {
-    const x = pos.getX(i);
-    const z = waterZ[i];
-
-    const ripple =
-      Math.sin(z * 0.55 + t * 1.5) * 0.045 +
-      Math.sin(x * 0.7 - t * 1.1) * 0.035 +
-      Math.sin((x + z) * 0.33 + t * 0.7) * 0.03;
-    pos.setY(i, ripple);
-
-    // the sun lays a gold column down the middle, brightest at the horizon
-    const across = (x - boatX) / 3.4;
-    const column = Math.exp(-across * across);
-    // Distance AHEAD OF THE BOAT, not absolute z. Keyed to z, the whole river
-    // turned gold once the trip ran far enough downstream.
-    const toHorizon = THREE.MathUtils.clamp((boatZ - z) / 110, 0, 1);
-    let gold = column * Math.pow(toHorizon, 1.5) * 1.1;
-
-    // crests catch the light, troughs don't
-    const crest = THREE.MathUtils.clamp((ripple + 0.06) / 0.14, 0, 1);
-    gold *= 0.45 + crest * 0.75;
-
-    const j = i * 3;
-    const shimmer = 0.82 + crest * 0.35;
-    // reuse one Color — cloning here allocated once per vertex per frame
-    warmScratch.copy(GOLD).lerp(EMBER, 1 - toHorizon);
-    col.array[j] = THREE.MathUtils.lerp(waterBase[j] * shimmer, warmScratch.r, gold);
-    col.array[j + 1] = THREE.MathUtils.lerp(waterBase[j + 1] * shimmer, warmScratch.g, gold);
-    col.array[j + 2] = THREE.MathUtils.lerp(waterBase[j + 2] * shimmer, warmScratch.b, gold);
-  }
-
-  pos.needsUpdate = true;
-  col.needsUpdate = true;
-  waterGeo.computeVertexNormals();
-}
-
-/* ------------------------------ distant hills ------------------------------ */
-
-function buildHills() {
+function buildHeadlands() {
   const group = new THREE.Group();
   const layers = [
-    { z: -305, h: 22, c: 0x6a5f8e, n: 7, spread: 210 },
-    { z: -268, h: 16, c: 0x4e4a72, n: 8, spread: 185 },
-    { z: -238, h: 12, c: 0x3a3a5c, n: 9, spread: 165 },
+    { z: -330, h: 26, c: 0x0b1222, n: 6, x0: -190, x1: 30 },
+    { z: -290, h: 17, c: 0x080d19, n: 7, x0: -170, x1: 10 },
+    { z: -255, h: 10, c: 0x050911, n: 7, x0: -150, x1: -10 },
   ];
 
   for (const L of layers) {
     const mat = new THREE.MeshBasicMaterial({ color: L.c, fog: false });
     for (let i = 0; i < L.n; i++) {
-      const w = 26 + hash(i, L.z) * 40;
+      const w = 24 + hash(i, L.z) * 36;
       const h = L.h * (0.55 + hash(i * 3.1, L.z) * 0.8);
       const shape = new THREE.Mesh(new THREE.ConeGeometry(w, h, 4 + (i % 3), 1), mat);
-      shape.position.set((i / (L.n - 1) - 0.5) * L.spread + hash(i, 7) * 12, h / 2 - 3, L.z);
+      shape.position.set(L.x0 + (i / (L.n - 1)) * (L.x1 - L.x0) + hash(i, 7) * 10, h / 2 - 3, L.z);
       shape.rotation.y = hash(i, 11) * Math.PI;
       group.add(shape);
     }
@@ -418,17 +572,170 @@ function buildHills() {
   return group;
 }
 
-scene.add(buildHills());
+const headlands = buildHeadlands();
+scene.add(headlands);
 
-/* ------------------------------ coconut palms ------------------------------ */
+/* ------------------------------ fishing boats ------------------------------ */
+/* A couple of small boats out past the breakers off the cat's right, lamps
+   lit. They keep pace with the walk, as if working the same stretch of
+   water, so they stay in view. Built along local +X (the bow), then turned
+   to run parallel to the shore. */
+
+const boatHullMat = new THREE.MeshStandardMaterial({ color: 0x1b2532, roughness: 0.9, flatShading: true });
+const boatTrimMat = new THREE.MeshStandardMaterial({ color: 0x5a6b7d, roughness: 0.8, flatShading: true });
+const boatCabinMat = new THREE.MeshStandardMaterial({ color: 0x2c3442, roughness: 0.9, flatShading: true });
+const boatWindowMat = new THREE.MeshBasicMaterial({ color: 0xffb35c });
+const boatLampMat = new THREE.MeshBasicMaterial({ color: 0xffe0a8 });
+
+const boatHullGeo = (() => {
+  // side profile: flat deck, a sheer rising to the bow, a raked stem
+  const shape = new THREE.Shape();
+  shape.moveTo(-1.9, 0.55);
+  shape.lineTo(1.4, 0.55);
+  shape.lineTo(2.3, 0.8);
+  shape.lineTo(1.5, -0.25);
+  shape.lineTo(-1.7, -0.25);
+  shape.lineTo(-2.0, 0.2);
+  shape.closePath();
+  const g = new THREE.ExtrudeGeometry(shape, { depth: 1.3, bevelEnabled: false });
+  g.translate(0, 0, -0.65);
+  // pinch the front into a pointed bow
+  const pos = g.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i);
+    if (x > 0.8) pos.setZ(i, pos.getZ(i) * Math.max(0.04, 1 - (x - 0.8) / 1.5));
+  }
+  g.computeVertexNormals();
+  return g;
+})();
+
+function makeBoatLight(color, size) {
+  const glow = new THREE.Sprite(
+    new THREE.SpriteMaterial({
+      map: makeGlowTexture(),
+      color,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      fog: false, // lamps carry through the haze
+    })
+  );
+  glow.scale.setScalar(size);
+  return glow;
+}
+
+function makeBoat() {
+  const boat = new THREE.Group();
+  const rocker = new THREE.Group(); // rolls and pitches on the swell
+  boat.add(rocker);
+
+  rocker.add(new THREE.Mesh(boatHullGeo, boatHullMat));
+
+  const rail = new THREE.Mesh(new THREE.BoxGeometry(3.6, 0.08, 1.34), boatTrimMat);
+  rail.position.set(-0.2, 0.58, 0);
+  rocker.add(rail);
+
+  const cabin = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.8, 0.95), boatCabinMat);
+  cabin.position.set(-0.85, 0.95, 0);
+  rocker.add(cabin);
+  const roof = new THREE.Mesh(new THREE.BoxGeometry(1.25, 0.08, 1.1), boatTrimMat);
+  roof.position.set(-0.85, 1.39, 0);
+  rocker.add(roof);
+
+  // lit windows, both sides of the cabin
+  const windowStrip = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.22, 0.97), boatWindowMat);
+  windowStrip.position.set(-0.85, 1.05, 0);
+  rocker.add(windowStrip);
+
+  const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.05, 2.3, 5), boatTrimMat);
+  mast.position.set(0.35, 1.7, 0);
+  rocker.add(mast);
+
+  // a lamp at the masthead and one hung at the stern
+  const lamps = [];
+  for (const [x, y, size] of [[0.35, 2.9, 0.65], [-1.75, 1.0, 0.45]]) {
+    const bulb = new THREE.Mesh(new THREE.IcosahedronGeometry(0.07, 0), boatLampMat);
+    bulb.position.set(x, y, 0);
+    rocker.add(bulb);
+    const glow = makeBoatLight(0xffb35c, size);
+    glow.position.copy(bulb.position);
+    rocker.add(glow);
+    lamps.push(glow);
+  }
+
+  // the masthead lamp's reflection: a long streak lying on the water,
+  // turned toward the camera each frame
+  const streak = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.55, 5),
+    new THREE.MeshBasicMaterial({
+      map: makeGlowTexture(),
+      color: 0xffa64d,
+      transparent: true,
+      opacity: 0.35,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      fog: false,
+    })
+  );
+  streak.rotation.x = -Math.PI / 2;
+  const streakPivot = new THREE.Group();
+  streakPivot.add(streak);
+  streak.position.z = 2.6; // stretch from under the boat toward the viewer
+  streakPivot.position.y = 0.12;
+  boat.add(streakPivot);
+
+  boat.userData = { rocker, lamps, streakPivot };
+  return boat;
+}
+
+// how far ahead of the cat along the shore, and how far out past the waterline
+const BOAT_SPOTS = [
+  { ahead: 55, out: 35, yaw: 0.25, phase: 0 },     // well offshore, a hazy silhouette
+  { ahead: 80, out: 60, yaw: -0.35, phase: 2.1 },  // out near the horizon, mostly just its lamps
+];
+
+const boats = BOAT_SPOTS.map((spot) => {
+  const boat = makeBoat();
+  boat.userData.spot = spot;
+  boat.userData.z = Z_START - spot.ahead;
+  scene.add(boat);
+  return boat;
+});
+
+function updateBoats(dt, t, catZ) {
+  for (const boat of boats) {
+    const { spot, rocker, lamps, streakPivot } = boat.userData;
+    const wantZ = catZ - spot.ahead;
+    // drift along with the walk; jump when the walk loops back to the start
+    if (Math.abs(wantZ - boat.userData.z) > 30) boat.userData.z = wantZ;
+    boat.userData.z += (wantZ - boat.userData.z) * Math.min(1, dt * 0.4);
+
+    const z = boat.userData.z;
+    boat.position.set(shoreX(z) + spot.out, -0.08 + Math.sin(t * 0.8 + spot.phase) * 0.06, z);
+    boat.rotation.y = Math.PI / 2 + spot.yaw; // bow runs along the shore
+    rocker.rotation.x = Math.sin(t * 0.7 + spot.phase) * 0.06;
+    rocker.rotation.z = Math.sin(t * 0.55 + spot.phase * 1.7) * 0.04;
+
+    for (const lamp of lamps) {
+      lamp.material.opacity = 0.8 + 0.12 * Math.sin(t * 7 + spot.phase + lamp.position.x);
+    }
+
+    // point the reflection streak at the camera
+    const toCam = Math.atan2(camera.position.x - boat.position.x, camera.position.z - boat.position.z);
+    streakPivot.rotation.y = toCam - boat.rotation.y;
+  }
+}
+
+/* ------------------------------ palms at the back ------------------------------ */
+/* Mostly silhouettes against the sky, so they're kept dark and simple. */
 
 const frondGeo = (() => {
   const g = new THREE.PlaneGeometry(2.9, 0.68, 10, 3);
   const pos = g.attributes.position;
   for (let i = 0; i < pos.count; i++) {
-    const along = pos.getX(i);              // -1.45 .. 1.45
-    const across = pos.getY(i);             // -0.34 .. 0.34
-    const t = Math.max(0, (along + 1.45) / 2.9);   // 0 at base, 1 at tip
+    const along = pos.getX(i);
+    const across = pos.getY(i);
+    const t = Math.max(0, (along + 1.45) / 2.9);
     const w = across * (1 - Math.pow(t, 2.4) * 0.92) * (0.45 + t * 0.9);
     const droop = Math.pow(t, 2.1) * 1.5;
     pos.setXYZ(i, along + 1.45, -droop + Math.abs(w) * 0.3, w);
@@ -452,37 +759,28 @@ function makeTrunkGeometry(height, lean) {
   return g;
 }
 
-const trunkMat = new THREE.MeshStandardMaterial({ color: 0x6b5236, flatShading: true, roughness: 0.95 });
-const frondMats = [0x2c5c34, 0x35693a, 0x24512f].map(
-  (c) => new THREE.MeshStandardMaterial({ color: c, flatShading: true, side: THREE.DoubleSide, roughness: 0.9 })
-);
-const coconutMat = new THREE.MeshStandardMaterial({ color: 0x4c3a24, flatShading: true });
+const TRUNKS = [
+  { h: 5.4, lean: 1.5 },
+  { h: 6.6, lean: 2.4 },
+  { h: 4.6, lean: 0.9 },
+  { h: 7.4, lean: 3.1 },
+].map((t) => ({ ...t, geo: makeTrunkGeometry(t.h, t.lean) }));
 
-// a handful of trunk shapes, shared between palms so we aren't rebuilding geometry
-const trunkGeos = [
-  makeTrunkGeometry(5.4, 1.5),
-  makeTrunkGeometry(6.6, 2.4),
-  makeTrunkGeometry(4.6, 0.9),
-  makeTrunkGeometry(7.4, 3.1),
-];
+const trunkMat = new THREE.MeshStandardMaterial({ color: 0x2b2622, flatShading: true, roughness: 1 });
+const frondMats = [0x13221a, 0x182a1f, 0x0f1c15].map(
+  (c) => new THREE.MeshStandardMaterial({ color: c, flatShading: true, side: THREE.DoubleSide, roughness: 1 })
+);
 
 const palms = [];
 
 function makePalm(seed) {
   const palm = new THREE.Group();
-  const gi = Math.floor(hash(seed, 1.7) * trunkGeos.length) % trunkGeos.length;
-  const geo = trunkGeos[gi];
-  const height = [5.4, 6.6, 4.6, 7.4][gi];
-  const lean = [1.5, 2.4, 0.9, 3.1][gi];
+  const trunk = TRUNKS[Math.floor(hash(seed, 1.7) * TRUNKS.length) % TRUNKS.length];
+  palm.add(new THREE.Mesh(trunk.geo, trunkMat));
 
-  const trunk = new THREE.Mesh(geo, trunkMat);
-  trunk.castShadow = true;
-  palm.add(trunk);
-
-  // the crown rides on top of the bent trunk
   const crown = new THREE.Group();
-  crown.position.set(lean, height, 0);
-  crown.rotation.z = -0.3;   // keep the fan tilted the way the trunk leans
+  crown.position.set(trunk.lean, trunk.h, 0);
+  crown.rotation.z = -0.3;
   palm.add(crown);
 
   const n = 7;
@@ -494,12 +792,6 @@ function makePalm(seed) {
     crown.add(frond);
   }
 
-  for (let i = 0; i < 3; i++) {
-    const nut = new THREE.Mesh(new THREE.IcosahedronGeometry(0.16, 0), coconutMat);
-    nut.position.set(Math.cos(i * 2.2) * 0.22, -0.16, Math.sin(i * 2.2) * 0.22);
-    crown.add(nut);
-  }
-
   palm.userData.crown = crown;
   palm.userData.swayPhase = hash(seed, 5.5) * Math.PI * 2;
   palm.userData.crownRestZ = crown.rotation.z;
@@ -507,762 +799,168 @@ function makePalm(seed) {
   return palm;
 }
 
-// line the banks, leaning out over the water
 let palmSeed = 0;
-for (let z = Z_START + 14; z > SCATTER_END; ) {
-  // past the loop point the bank is only ever seen through haze, so thin it out
-  const inHaze = z < Z_END;
-  for (const side of [-1, 1]) {
-    const n = inHaze ? 1 : 1 + Math.floor(hash(z, side) * 2);
-    for (let k = 0; k < n; k++) {
-      palmSeed += 1;
-      const inset = RIVER_HALF + 0.9 + hash(palmSeed, z) * 7;
-      const zz = z + (hash(palmSeed, 2.2) - 0.5) * 5;
-      const x = riverCenterX(zz) + side * inset;
-      const palm = makePalm(palmSeed);
-      palm.position.set(x, groundHeight(x, zz) - 0.15, zz);
-      // lean out over the river, with some scatter
-      palm.rotation.y = (side < 0 ? 0 : Math.PI) + (hash(palmSeed, 9) - 0.5) * 1.5;
-      palm.scale.setScalar(0.75 + hash(palmSeed, 4) * 0.5);
-      scene.add(palm);
-    }
-  }
-  z -= inHaze ? 11 : 6.5;
+for (let z = Z_START + 40; z > Z_END - 90; z -= 4 + hash(z, 3) * 5) {
+  palmSeed += 1;
+  const s = 19 + hash(palmSeed, z) * 14;
+  const palm = makePalm(palmSeed);
+  palm.position.set(shoreX(z) - s, sandH(s) - 0.15, z);
+  // lean out toward the sea, with some scatter
+  palm.rotation.y = Math.PI + (hash(palmSeed, 9) - 0.5) * 1.6;
+  palm.scale.setScalar(0.8 + hash(palmSeed, 4) * 0.5);
+  scene.add(palm);
 }
 
-/* ------------------------------ bank clutter ------------------------------ */
+/* ------------------------------ rocks and driftwood ------------------------------ */
 
-const bushMat = new THREE.MeshStandardMaterial({ color: 0x2f5c32, flatShading: true, roughness: 1 });
-const bushGeo = new THREE.IcosahedronGeometry(0.5, 0);
+const rockMat = new THREE.MeshStandardMaterial({ color: 0x343844, flatShading: true, roughness: 0.95 });
+const woodMat = new THREE.MeshStandardMaterial({ color: 0x6b6258, flatShading: true, roughness: 1 });
 
-for (let i = 0; i < 200; i++) {
-  const zz = Z_START + 16 - hash(i, 1.1) * (Z_START + 16 - SCATTER_END);
-  const side = hash(i, 2.7) > 0.5 ? 1 : -1;
-  const x = riverCenterX(zz) + side * (RIVER_HALF + 0.3 + hash(i, 3.3) * 9);
-  const clump = new THREE.Group();
-  const blobs = 2 + Math.floor(hash(i, 4.4) * 3);
-  for (let b = 0; b < blobs; b++) {
-    const blob = new THREE.Mesh(bushGeo, bushMat);
-    blob.position.set((hash(i, b) - 0.5) * 0.7, 0.25 + hash(i, b * 2) * 0.2, (hash(i, b * 3) - 0.5) * 0.7);
-    blob.scale.setScalar(0.5 + hash(i, b * 5) * 0.7);
-    blob.castShadow = true;
-    clump.add(blob);
-  }
-  clump.position.set(x, groundHeight(x, zz), zz);
-  scene.add(clump);
+for (let i = 0; i < 46; i++) {
+  const z = Z_START + 30 - hash(i, 1.3) * (Z_START - Z_END + 110);
+  const s = 7 + hash(i, 2.9) * 12;
+  const r = 0.25 + Math.pow(hash(i, 4.1), 2) * 1.1;
+  const rock = new THREE.Mesh(new THREE.IcosahedronGeometry(r, 0), rockMat);
+  rock.position.set(shoreX(z) - s, sandH(s) + r * 0.25, z);
+  rock.scale.set(1, 0.55 + hash(i, 5) * 0.4, 0.8 + hash(i, 6) * 0.5);
+  rock.rotation.set(hash(i, 7) * 3, hash(i, 8) * 3, 0);
+  scene.add(rock);
 }
 
-// reeds right at the waterline
-const reedMat = new THREE.MeshStandardMaterial({ color: 0x6f7f3a, flatShading: true });
-const reedGeo = new THREE.CylinderGeometry(0.015, 0.03, 1.1, 4);
-reedGeo.translate(0, 0.55, 0);   // stand it on its base, not its middle
-const reeds = [];
-for (let i = 0; i < 295; i++) {
-  const zz = Z_START + 18 - hash(i, 5.1) * (Z_START + 18 - SCATTER_END);
-  const side = hash(i, 6.2) > 0.5 ? 1 : -1;
-  const x = riverCenterX(zz) + side * (RIVER_HALF - 0.5 + hash(i, 7.3) * 1.6);
-  const reed = new THREE.Mesh(reedGeo, reedMat);
-  reed.position.set(x, groundHeight(x, zz), zz);
-  reed.scale.setScalar(0.6 + hash(i, 8) * 0.8);
-  reed.userData.phase = hash(i, 9) * Math.PI * 2;
-  scene.add(reed);
-  reeds.push(reed);
+for (let i = 0; i < 14; i++) {
+  const z = Z_START + 20 - hash(i, 9.1) * (Z_START - Z_END + 80);
+  const s = 4.8 + hash(i, 3.7) * 6;
+  const len = 1.2 + hash(i, 1.1) * 2.2;
+  const log = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.13, len, 6), woodMat);
+  log.position.set(shoreX(z) - s, sandH(s) + 0.07, z);
+  log.rotation.order = 'YXZ';   // lay it down first, then turn it
+  log.rotation.set(0, hash(i, 2.2) * Math.PI, Math.PI / 2);
+  scene.add(log);
 }
 
-// thatched huts, well back from the bank
-function makeHut() {
-  const hut = new THREE.Group();
-  const wall = new THREE.Mesh(
-    new THREE.BoxGeometry(2.2, 1.3, 1.9),
-    new THREE.MeshStandardMaterial({ color: 0xd9c6a2, flatShading: true, roughness: 1 })
-  );
-  wall.position.y = 0.65;
-  wall.castShadow = true;
-  hut.add(wall);
+/* -------------------------------- the cat -------------------------------- */
+/* the same white cat from the meadow, in its night-time glow */
 
-  const roof = new THREE.Mesh(
-    new THREE.ConeGeometry(2.1, 1.35, 4),
-    new THREE.MeshStandardMaterial({ color: 0x7d5a30, flatShading: true, roughness: 1 })
-  );
-  roof.position.y = 1.95;
-  roof.rotation.y = Math.PI / 4;
-  roof.castShadow = true;
-  hut.add(roof);
+const cat = makeCat();
+// no glow or halo here, just a faint self-light so the white cat still
+// reads as white with the moon behind it
+cat.userData.whiteMat.emissiveIntensity = 0.1;
+scene.add(cat);
 
-  const door = new THREE.Mesh(
-    new THREE.BoxGeometry(0.55, 0.9, 0.06),
-    new THREE.MeshStandardMaterial({ color: 0x3a2a1c, flatShading: true })
-  );
-  door.position.set(0, 0.45, 0.97);
-  hut.add(door);
-  return hut;
-}
+// paw spots in the cat's own space (legs, times the cat's 1.1 scale)
+const PAW_X = 0.17 * 1.1;
+const PAW_Z = 0.28 * 1.1;
 
-for (let i = 0; i < 8; i++) {
-  const zz = Z_START - 6 - i * 26 - hash(i, 3) * 8;
-  const side = i % 2 === 0 ? -1 : 1;
-  const x = riverCenterX(zz) + side * (RIVER_HALF + 7 + hash(i, 4) * 4);
-  const hut = makeHut();
-  hut.position.set(x, groundHeight(x, zz) - 0.1, zz);
-  hut.rotation.y = (side < 0 ? 1 : -1) * (0.9 + hash(i, 5) * 0.6);
-  scene.add(hut);
-}
+/* ------------------------------ splashes of light ------------------------------ */
+/* little sparks kicked up by the feet when they land in the swash */
 
-/* ------------------------------ on the water ------------------------------ */
+const SPARK_COUNT = 240;
+const sparkPos = new Float32Array(SPARK_COUNT * 3);
+const sparkCol = new Float32Array(SPARK_COUNT * 3);
+const sparkVel = new Float32Array(SPARK_COUNT * 3);
+const sparkLife = new Float32Array(SPARK_COUNT);
+const sparkGeo = new THREE.BufferGeometry();
+sparkGeo.setAttribute('position', new THREE.BufferAttribute(sparkPos, 3));
+sparkGeo.setAttribute('color', new THREE.BufferAttribute(sparkCol, 3));
+const sparks = new THREE.Points(
+  sparkGeo,
+  new THREE.PointsMaterial({
+    size: 0.07,
+    vertexColors: true,
+    transparent: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  })
+);
+sparks.frustumCulled = false;
+scene.add(sparks);
 
-// water hyacinth — the green rafts that choke every backwater
-const hyacinthLeafMat = new THREE.MeshStandardMaterial({ color: 0x3f7a3f, flatShading: true, roughness: 0.9 });
-const hyacinthBloomMat = new THREE.MeshStandardMaterial({ color: 0xb79ad8, flatShading: true });
-const hyacinthLeafGeo = new THREE.IcosahedronGeometry(0.2, 0);
-const hyacinthBloomGeo = new THREE.IcosahedronGeometry(0.07, 0);
-const floaters = [];
+let sparkCursor = 0;
 
-for (let i = 0; i < 60; i++) {
-  const zz = Z_START + 10 - hash(i, 11.1) * (Z_START + 10 - SCATTER_END);
-  const u = (hash(i, 12.2) - 0.5) * 1.75;
-  const clump = new THREE.Group();
-  const leaves = 4 + Math.floor(hash(i, 13.3) * 4);
-  for (let l = 0; l < leaves; l++) {
-    const leaf = new THREE.Mesh(hyacinthLeafGeo, hyacinthLeafMat);
-    leaf.position.set((hash(i, l) - 0.5) * 0.85, 0.06, (hash(i, l * 2) - 0.5) * 0.85);
-    leaf.scale.set(1.1, 0.42, 1.1);
-    clump.add(leaf);
-  }
-  if (hash(i, 14) > 0.55) {
-    const bloom = new THREE.Mesh(hyacinthBloomGeo, hyacinthBloomMat);
-    bloom.position.set(0, 0.2, 0);
-    clump.add(bloom);
-  }
-  clump.position.set(riverCenterX(zz) + u * RIVER_HALF, 0.02, zz);
-  clump.userData.side = u >= 0 ? 1 : -1;
-  clump.userData.restU = u;
-  clump.userData.u = u;
-  clump.userData.z = zz;
-  clump.userData.phase = hash(i, 15) * Math.PI * 2;
-  scene.add(clump);
-  floaters.push(clump);
-}
-
-// lily pads, with the occasional lotus
-const padMat = new THREE.MeshStandardMaterial({ color: 0x2f6b40, flatShading: true, side: THREE.DoubleSide });
-const padGeo = new THREE.CircleGeometry(0.34, 9, 0.25, Math.PI * 1.85);
-padGeo.rotateX(-Math.PI / 2);
-const lotusMat = new THREE.MeshStandardMaterial({ color: 0xffb3cd, flatShading: true });
-
-for (let i = 0; i < 92; i++) {
-  const zz = Z_START + 12 - hash(i, 16.1) * (Z_START + 12 - SCATTER_END);
-  // pads can't move, so seed them clear of the lane the boat runs down
-  const raw = (hash(i, 17.2) - 0.5) * 2;
-  const u = (raw >= 0 ? 1 : -1) * (0.46 + Math.abs(raw) * 0.48);
-  const pad = new THREE.Mesh(padGeo, padMat);
-  pad.position.set(riverCenterX(zz) + u * RIVER_HALF, 0.03, zz);
-  pad.rotation.y = hash(i, 18) * Math.PI * 2;
-  pad.scale.setScalar(0.7 + hash(i, 19) * 0.7);
-  scene.add(pad);
-
-  if (hash(i, 20) > 0.82) {
-    const lotus = new THREE.Group();
-    for (let p = 0; p < 5; p++) {
-      const petal = new THREE.Mesh(new THREE.ConeGeometry(0.06, 0.18, 4), lotusMat);
-      petal.position.set(Math.cos((p / 5) * Math.PI * 2) * 0.05, 0.12, Math.sin((p / 5) * Math.PI * 2) * 0.05);
-      petal.rotation.x = Math.cos((p / 5) * Math.PI * 2) * 0.35;
-      petal.rotation.z = Math.sin((p / 5) * Math.PI * 2) * 0.35;
-      lotus.add(petal);
-    }
-    lotus.position.copy(pad.position);
-    lotus.position.y = 0.06;
-    scene.add(lotus);
+function kickSparks(x, z, n, power) {
+  for (let i = 0; i < n; i++) {
+    const j = sparkCursor;
+    sparkCursor = (sparkCursor + 1) % SPARK_COUNT;
+    const a = Math.random() * Math.PI * 2;
+    const r = Math.random() * 0.12;
+    sparkPos[j * 3] = x + Math.cos(a) * r;
+    sparkPos[j * 3 + 1] = sandH(WALK_S) + 0.03;
+    sparkPos[j * 3 + 2] = z + Math.sin(a) * r;
+    sparkVel[j * 3] = Math.cos(a) * (0.3 + Math.random() * 0.6) * power;
+    sparkVel[j * 3 + 1] = (0.8 + Math.random() * 1.4) * power;
+    sparkVel[j * 3 + 2] = Math.sin(a) * (0.3 + Math.random() * 0.6) * power;
+    sparkLife[j] = 0.6 + Math.random() * 0.6;
   }
 }
 
-// bamboo channel markers driven into the shallows
-const bambooMat = new THREE.MeshStandardMaterial({ color: 0x9a8f4f, flatShading: true });
-for (let i = 0; i < 34; i++) {
-  const zz = Z_START + 6 - hash(i, 21.1) * (Z_START + 6 - SCATTER_END);
-  const side = hash(i, 22.2) > 0.5 ? 1 : -1;
-  const x = riverCenterX(zz) + side * (RIVER_HALF - 0.8 - hash(i, 23.3) * 1.2);
-  const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.06, 2.6, 5), bambooMat);
-  pole.position.set(x, 0.9, zz);
-  pole.rotation.z = (hash(i, 24) - 0.5) * 0.5;
-  pole.rotation.x = (hash(i, 25) - 0.5) * 0.3;
-  pole.castShadow = true;
-  scene.add(pole);
-}
-
-// ducks
-const DUCK_LANE = RIVER_HALF - 0.6;   // how far out a duck can paddle
-const BOAT_CLEAR = 1.55;              // hull half-width plus a margin
-const DUCK_ALERT_Z = 7;               // how far off it notices the boat
-
-const duckBodyMat = new THREE.MeshStandardMaterial({ color: 0xf2ece0, flatShading: true });
-const duckHeadMat = new THREE.MeshStandardMaterial({ color: 0x3c3a36, flatShading: true });
-const duckBeakMat = new THREE.MeshStandardMaterial({ color: 0xe8a33d, flatShading: true });
-const ducks = [];
-
-function makeDuck() {
-  const duck = new THREE.Group();
-  const body = new THREE.Mesh(new THREE.IcosahedronGeometry(0.2, 0), duckBodyMat);
-  body.scale.set(1.25, 0.8, 1);
-  body.castShadow = true;
-  duck.add(body);
-
-  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.06, 0.24, 5), duckHeadMat);
-  neck.position.set(0, 0.16, 0.14);
-  neck.rotation.x = 0.25;
-  duck.add(neck);
-
-  const head = new THREE.Mesh(new THREE.IcosahedronGeometry(0.085, 0), duckHeadMat);
-  head.position.set(0, 0.29, 0.19);
-  duck.add(head);
-
-  const beak = new THREE.Mesh(new THREE.ConeGeometry(0.035, 0.1, 4), duckBeakMat);
-  beak.position.set(0, 0.28, 0.28);
-  beak.rotation.x = Math.PI / 2;
-  duck.add(beak);
-  return duck;
-}
-
-for (let i = 0; i < 16; i++) {
-  const zz = Z_START - hash(i, 26.1) * (Z_START - SCATTER_END);
-  const duck = makeDuck();
-  // each duck picks a bank to favour, so it always breaks the same way
-  const side = hash(i, 27.2) > 0.5 ? 1 : -1;
-  duck.userData.side = side;
-  duck.userData.restU = side * (0.12 + hash(i, 27.9) * 0.62);
-  duck.userData.u = duck.userData.restU;
-  duck.userData.vLat = 0;
-  duck.userData.bobPhase = hash(i, 30.5) * Math.PI * 2;
-  duck.userData.z = zz;
-  duck.userData.phase = hash(i, 28.3) * Math.PI * 2;
-  duck.userData.rate = 0.25 + hash(i, 29.4) * 0.3;
-  scene.add(duck);
-  ducks.push(duck);
-}
-
-/* --------------------------------- fish --------------------------------- */
-/* Mostly you see them as shapes sliding under the surface. Now and then one
-   breaks clear of the water — but only a tenth of the time. */
-
-const FISH_COUNT = 34;
-const JUMP_CHANCE = 0.1;   // of every surfacing, this fraction become jumps
-
-const fishBodyGeo = new THREE.IcosahedronGeometry(0.17, 0);
-fishBodyGeo.scale(0.5, 0.72, 1.6);
-
-const fishTailGeo = new THREE.ConeGeometry(0.13, 0.26, 3);
-fishTailGeo.rotateX(-Math.PI / 2);   // flare backwards, along -Z
-fishTailGeo.scale(0.22, 1, 1);
-
-const fishDorsalGeo = new THREE.ConeGeometry(0.08, 0.15, 3);
-fishDorsalGeo.scale(0.2, 1, 1);
-
-const fishBodyMat = new THREE.MeshStandardMaterial({
-  color: 0xb9c9cc,
-  flatShading: true,
-  metalness: 0.45,
-  roughness: 0.32,
-  emissive: 0x4a3a20,
-  emissiveIntensity: 0.5,
-});
-const fishFinMat = new THREE.MeshStandardMaterial({
-  color: 0x8a9aa0,
-  flatShading: true,
-  side: THREE.DoubleSide,
-  roughness: 0.6,
-});
-
-function makeFish() {
-  const fish = new THREE.Group();
-  // pitch lives on a child so the jump arc doesn't fight the yaw
-  const pitch = new THREE.Group();
-  fish.add(pitch);
-
-  pitch.add(new THREE.Mesh(fishBodyGeo, fishBodyMat));
-
-  const tail = new THREE.Mesh(fishTailGeo, fishFinMat);
-  tail.position.z = -0.3;
-  pitch.add(tail);
-
-  const dorsal = new THREE.Mesh(fishDorsalGeo, fishFinMat);
-  dorsal.position.set(0, 0.13, 0.02);
-  pitch.add(dorsal);
-
-  fish.userData.pitch = pitch;
-  fish.userData.tail = tail;
-  return fish;
-}
-
-const fishes = [];
-for (let i = 0; i < FISH_COUNT; i++) {
-  const fish = makeFish();
-  const d = fish.userData;
-  d.z = Z_START + 10 - hash(i, 41.1) * (Z_START + 10 - SCATTER_END);
-  d.restU = (hash(i, 42.2) - 0.5) * 1.55;
-  d.phase = hash(i, 43.3) * Math.PI * 2;
-  d.speed = 0.5 + hash(i, 44.4) * 0.8;
-  d.depth = -0.19 - hash(i, 45.5) * 0.16;   // shallow enough to read through the water
-  d.wander = 0.18 + hash(i, 46.6) * 0.22;
-  d.state = 'swim';
-  d.timer = 2 + hash(i, 47.7) * 8;
-  d.jumpT = 0;
-  d.jumpDur = 0;
-  d.jumpHeight = 0;
-  fish.scale.setScalar(0.85 + hash(i, 48.8) * 0.65);
-  scene.add(fish);
-  fishes.push(fish);
-}
-
-/* splash rings, spawned as a fish leaves and re-enters the water */
-
-const splashMat = new THREE.MeshBasicMaterial({
-  color: 0xfff6e2,
-  transparent: true,
-  opacity: 0.5,
-  side: THREE.DoubleSide,
-  depthWrite: false,
-});
-const splashGeo = new THREE.RingGeometry(0.1, 0.18, 14);
-splashGeo.rotateX(-Math.PI / 2);
-
-const splashes = [];
-for (let i = 0; i < 12; i++) {
-  const ring = new THREE.Mesh(splashGeo, splashMat.clone());
-  ring.visible = false;
-  ring.renderOrder = 2;
-  scene.add(ring);
-  splashes.push({ mesh: ring, life: 0 });
-}
-let splashCursor = 0;
-
-function spawnSplash(x, z) {
-  const sp = splashes[splashCursor];
-  splashCursor = (splashCursor + 1) % splashes.length;
-  sp.mesh.position.set(x, 0.05, z);
-  sp.mesh.scale.setScalar(0.5);
-  sp.mesh.visible = true;
-  sp.life = 1;
-}
-
-function updateFish(dt, t) {
-  for (const fish of fishes) {
-    const d = fish.userData;
-
-    d.z -= dt * d.speed;
-    if (d.z > trip.z + 55 || d.z < trip.z - 155) {
-      d.z = trip.z - 95 - Math.random() * 45;
-      d.state = 'swim';
-    }
-
-    // weaving path, with the heading taken from the analytic derivative so
-    // there is no frame-to-frame noise in it
-    const w = t * 0.55 + d.phase;
-    const uBase = d.restU + Math.sin(w) * d.wander;
-    // they swim shallow now, so they have to go round the hull
-    const nearBoat = 1 - Math.min(1, Math.abs(d.z - trip.z) / 5.5);
-    const side = d.restU >= 0 ? 1 : -1;
-    const u = THREE.MathUtils.lerp(
-      uBase,
-      side * Math.max(Math.abs(uBase), 1.9 / RIVER_HALF),
-      nearBoat
-    );
-    const latV = Math.cos(w) * d.wander * 0.55 * RIVER_HALF;
-
-    let y = d.depth;
-    let pitchX = 0;
-
-    if (d.state === 'swim') {
-      d.timer -= dt;
-      if (d.timer <= 0) {
-        d.timer = 4 + Math.random() * 9;
-        // keep clear of the hull, and only a tenth of these become jumps
-        const clearOfBoat = Math.abs(d.z - trip.z) > 5 || Math.abs(u * RIVER_HALF) > 2.2;
-        if (clearOfBoat && Math.random() < JUMP_CHANCE) {
-          d.state = 'jump';
-          d.jumpT = 0;
-          d.jumpDur = 0.7 + Math.random() * 0.35;
-          d.jumpHeight = 0.55 + Math.random() * 0.45;
-          spawnSplash(riverCenterX(d.z) + u * RIVER_HALF, d.z);
-        }
-      }
-    } else {
-      d.jumpT += dt;
-      const p = d.jumpT / d.jumpDur;
-      if (p >= 1) {
-        d.state = 'swim';
-        spawnSplash(riverCenterX(d.z) + u * RIVER_HALF, d.z);
-      } else {
-        y = d.depth + Math.sin(p * Math.PI) * (d.jumpHeight - d.depth + 0.22);
-        pitchX = -0.85 * Math.cos(p * Math.PI);   // nose up, then down
-      }
-    }
-
-    fish.position.set(riverCenterX(d.z) + u * RIVER_HALF, y, d.z);
-    fish.rotation.y = Math.atan2(latV, -d.speed);
-    d.pitch.rotation.x = pitchX;
-    // tail beats faster mid-jump
-    d.tail.rotation.y = Math.sin(t * (d.state === 'jump' ? 16 : 9) + d.phase) * 0.55;
-  }
-
-  for (const sp of splashes) {
-    if (sp.life <= 0) continue;
-    sp.life -= dt * 1.6;
-    if (sp.life <= 0) {
-      sp.mesh.visible = false;
+function updateSparks(dt) {
+  for (let i = 0; i < SPARK_COUNT; i++) {
+    if (sparkLife[i] <= 0) {
+      sparkCol[i * 3] = sparkCol[i * 3 + 1] = sparkCol[i * 3 + 2] = 0;
       continue;
     }
-    sp.mesh.scale.setScalar(0.5 + (1 - sp.life) * 2.4);
-    sp.mesh.material.opacity = sp.life * 0.5;
+    sparkLife[i] -= dt;
+    sparkVel[i * 3 + 1] -= 6 * dt;
+    sparkPos[i * 3] += sparkVel[i * 3] * dt;
+    sparkPos[i * 3 + 1] = Math.max(sandH(WALK_S), sparkPos[i * 3 + 1] + sparkVel[i * 3 + 1] * dt);
+    sparkPos[i * 3 + 2] += sparkVel[i * 3 + 2] * dt;
+    const b = Math.max(0, sparkLife[i]) * 2.6;
+    sparkCol[i * 3] = 0.15 * b;
+    sparkCol[i * 3 + 1] = 0.75 * b;
+    sparkCol[i * 3 + 2] = 1.0 * b;
   }
-}
-
-/* -------------------------------- birds -------------------------------- */
-
-const birdMat = new THREE.MeshBasicMaterial({ color: 0x3b3550, fog: false });
-const birdWingGeo = new THREE.BoxGeometry(0.62, 0.035, 0.12);
-const birds = [];
-
-for (let i = 0; i < 9; i++) {
-  const bird = new THREE.Group();
-  const left = new THREE.Mesh(birdWingGeo, birdMat);
-  left.position.x = -0.3;
-  bird.add(left);
-  const right = new THREE.Mesh(birdWingGeo, birdMat);
-  right.position.x = 0.3;
-  bird.add(right);
-
-  bird.userData.wings = [left, right];
-  bird.userData.phase = hash(i, 31) * Math.PI * 2;
-  bird.userData.radius = 16 + hash(i, 32) * 26;
-  bird.userData.height = 12 + hash(i, 33) * 12;
-  bird.userData.speed = 0.06 + hash(i, 34) * 0.05;
-  bird.userData.zBase = -40 - hash(i, 35) * 60;
-  bird.scale.setScalar(0.7 + hash(i, 36) * 0.8);
-  scene.add(bird);
-  birds.push(bird);
-}
-
-/* ---------------------------- the kettuvallam ---------------------------- */
-/* hull built from cross-sections along its length: the ends taper to nothing
-   and sweep upward, which is what gives a kettuvallam its silhouette */
-
-function buildHull(length, halfWidth, depth, upturn) {
-  const RINGS = 28;
-  const rings = [];
-
-  for (let r = 0; r <= RINGS; r++) {
-    const t = r / RINGS;
-    const z = (t - 0.5) * length;
-    const taper = Math.pow(Math.max(0, Math.sin(t * Math.PI)), 0.7);
-    const hw = halfWidth * taper;
-    const d = depth * Math.pow(taper, 0.55);
-    // the gunwale sweeps up toward both ends — gently, or the deck that
-    // follows it turns into a big flat ramp
-    const sheer = upturn * Math.pow(1 - Math.sin(t * Math.PI), 1.7);
-
-    rings.push([
-      new THREE.Vector3(-hw, sheer, z),
-      new THREE.Vector3(-hw * 0.84, sheer - d * 0.5, z),
-      new THREE.Vector3(0, sheer - d, z),
-      new THREE.Vector3(hw * 0.84, sheer - d * 0.5, z),
-      new THREE.Vector3(hw, sheer, z),
-    ]);
-  }
-
-  const hullVerts = [];
-  const deckVerts = [];
-  const railVerts = [];
-  const quad = (target, a, b, c, d) => {
-    target.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
-    target.push(a.x, a.y, a.z, c.x, c.y, c.z, d.x, d.y, d.z);
-  };
-  const lift = (v, dy) => new THREE.Vector3(v.x, v.y + dy, v.z);
-
-  for (let r = 0; r < RINGS; r++) {
-    const A = rings[r];
-    const B = rings[r + 1];
-    for (let s2 = 0; s2 < 4; s2++) quad(hullVerts, A[s2], B[s2], B[s2 + 1], A[s2 + 1]);
-    // deck sits just under the gunwale so you can't see into the hull
-    quad(deckVerts, lift(A[0], -0.06), lift(B[0], -0.06), lift(B[4], -0.06), lift(A[4], -0.06));
-    // rail: a thin ribbon that follows the gunwale instead of a straight box
-    for (const idx of [0, 4]) {
-      quad(railVerts, A[idx], B[idx], lift(B[idx], 0.08), lift(A[idx], 0.08));
-    }
-  }
-
-  const mk = (arr) => {
-    const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.Float32BufferAttribute(arr, 3));
-    g.computeVertexNormals();
-    return g;
-  };
-  return { hull: mk(hullVerts), deck: mk(deckVerts), rail: mk(railVerts) };
-}
-
-// the slender upswept beak at each end — the kettuvallam's signature
-function makeBeak(mat) {
-  const geo = new THREE.TorusGeometry(0.72, 0.05, 4, 16, Math.PI * 0.62);
-  const beak = new THREE.Mesh(geo, mat);
-  beak.scale.set(1, 1, 0.3);   // flatten it into a blade, not a tube
-  beak.castShadow = true;
-  return beak;
-}
-
-const CANOPY_R = 0.58;
-const CANOPY_LEN = 3.0;
-
-function makeBoat() {
-  const boat = new THREE.Group();
-
-  const { hull, deck, rail } = buildHull(6.8, 0.78, 0.66, 0.4);
-
-  const hullMesh = new THREE.Mesh(
-    hull,
-    new THREE.MeshStandardMaterial({
-      color: 0x2a211c,
-      flatShading: true,
-      roughness: 0.55,
-      side: THREE.DoubleSide,
-    })
-  );
-  hullMesh.castShadow = true;
-  boat.add(hullMesh);
-
-  const deckMesh = new THREE.Mesh(
-    deck,
-    new THREE.MeshStandardMaterial({ color: 0x8a6a42, flatShading: true, roughness: 0.9 })
-  );
-  deckMesh.receiveShadow = true;
-  boat.add(deckMesh);
-
-  const trimMat = new THREE.MeshStandardMaterial({
-    color: 0xc9a05a,
-    flatShading: true,
-    metalness: 0.25,
-    roughness: 0.55,
-    side: THREE.DoubleSide,
-  });
-  const railMesh = new THREE.Mesh(rail, trimMat);
-  boat.add(railMesh);
-
-  // upswept beaks at bow and stern. The torus arc is built in the XY plane,
-  // so it has to be turned a quarter turn to sweep along the hull, not across it.
-  const beakMat = new THREE.MeshStandardMaterial({
-    color: 0x3a2c22,
-    flatShading: true,
-    roughness: 0.6,
-    side: THREE.DoubleSide,
-  });
-  for (const end of [1, -1]) {
-    const beak = makeBeak(beakMat);
-    beak.rotation.y = end * Math.PI * 0.5;
-    beak.position.set(0, 0.3, end * 4.02);
-    boat.add(beak);
-  }
-
-  /* the arched palm-thatch canopy */
-  const canopy = new THREE.Group();
-  canopy.position.set(0, 0.04, -0.25);
-
-  const thatchGeo = new THREE.CylinderGeometry(
-    CANOPY_R, CANOPY_R, CANOPY_LEN, 14, 1, true, Math.PI / 2, Math.PI
-  );
-  thatchGeo.rotateX(Math.PI / 2);   // axis along the boat, dome facing up
-  const thatch = new THREE.Mesh(
-    thatchGeo,
-    new THREE.MeshStandardMaterial({
-      color: 0xb98d4e,
-      flatShading: true,
-      roughness: 1,
-      side: THREE.DoubleSide,
-    })
-  );
-  thatch.castShadow = true;
-  canopy.add(thatch);
-
-  // darker bamboo ribs strapping the thatch down
-  const ribMat = new THREE.MeshStandardMaterial({ color: 0x6d4f28, flatShading: true });
-  for (let i = 0; i < 5; i++) {
-    const rib = new THREE.Mesh(
-      new THREE.TorusGeometry(CANOPY_R + 0.02, 0.032, 4, 14, Math.PI),
-      ribMat
-    );
-    rib.position.z = -CANOPY_LEN / 2 + i * (CANOPY_LEN / 4);
-    canopy.add(rib);
-  }
-
-  // end curtains, so the canopy reads as enclosed
-  const curtainMat = new THREE.MeshStandardMaterial({
-    color: 0xa87f44,
-    flatShading: true,
-    side: THREE.DoubleSide,
-  });
-  for (const z of [-CANOPY_LEN / 2, CANOPY_LEN / 2]) {
-    const curtain = new THREE.Mesh(
-      new THREE.CircleGeometry(CANOPY_R, 14, 0, Math.PI),
-      curtainMat
-    );
-    curtain.position.z = z;
-    canopy.add(curtain);
-  }
-  boat.add(canopy);
-
-  // a warm lantern hanging at the prow — the one thing that isn't sunlight
-  const lantern = new THREE.Group();
-  const glass = new THREE.Mesh(
-    new THREE.IcosahedronGeometry(0.13, 0),
-    new THREE.MeshBasicMaterial({ color: 0xffd98a })
-  );
-  lantern.add(glass);
-  const lanternLight = new THREE.PointLight(0xffb45c, 2.4, 4.5, 2);
-  lantern.add(lanternLight);
-  lantern.position.set(0, 0.66, 2.35);
-  boat.add(lantern);
-
-  const hook = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.02, 0.02, 0.5, 4),
-    new THREE.MeshStandardMaterial({ color: 0x4a3a28, flatShading: true })
-  );
-  hook.position.set(0, 0.92, 2.35);
-  boat.add(hook);
-
-  /* the boatman, poling from the stern */
-  const man = new THREE.Group();
-  man.position.set(0, 0.02, -2.45);
-
-  const skin = new THREE.MeshStandardMaterial({ color: 0x8a5a3b, flatShading: true, roughness: 0.85 });
-  const mundu = new THREE.MeshStandardMaterial({ color: 0xf4efe4, flatShading: true, roughness: 0.95 });
-
-  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.42, 0.19), skin);
-  torso.position.y = 0.72;
-  torso.castShadow = true;
-  man.add(torso);
-
-  const wrap = new THREE.Mesh(new THREE.CylinderGeometry(0.19, 0.23, 0.52, 7), mundu);
-  wrap.position.y = 0.3;
-  wrap.castShadow = true;
-  man.add(wrap);
-
-  const head = new THREE.Mesh(new THREE.IcosahedronGeometry(0.13, 0), skin);
-  head.position.y = 1.05;
-  head.castShadow = true;
-  man.add(head);
-
-  const hair = new THREE.Mesh(new THREE.IcosahedronGeometry(0.135, 0), new THREE.MeshStandardMaterial({ color: 0x241a14, flatShading: true }));
-  hair.position.y = 1.09;
-  hair.scale.set(1, 0.72, 1);
-  man.add(hair);
-
-  const armGeo = new THREE.CylinderGeometry(0.045, 0.045, 0.46, 5);
-  const arms = [];
-  for (const side of [-1, 1]) {
-    const pivot = new THREE.Group();
-    pivot.position.set(side * 0.17, 0.9, 0);
-    const arm = new THREE.Mesh(armGeo, skin);
-    arm.position.y = -0.23;
-    pivot.add(arm);
-    man.add(pivot);
-    arms.push(pivot);
-  }
-
-  // the pole: pivots from his hands, dips into the water behind the boat
-  const polePivot = new THREE.Group();
-  polePivot.position.set(0.42, 0.9, -0.05);
-  const pole = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.032, 0.042, 3.2, 5),
-    new THREE.MeshStandardMaterial({ color: 0xa8935a, flatShading: true })
-  );
-  pole.position.y = -1.35;
-  pole.castShadow = true;
-  polePivot.add(pole);
-  man.add(polePivot);
-
-  boat.add(man);
-
-  boat.userData.arms = arms;
-  boat.userData.polePivot = polePivot;
-  boat.userData.man = man;
-  boat.userData.lantern = lanternLight;
-  return boat;
-}
-
-const boat = makeBoat();
-scene.add(boat);
-
-/* ------------------------------ boat wake ------------------------------ */
-
-const wakeMat = new THREE.MeshBasicMaterial({
-  color: 0xfff0d0,
-  transparent: true,
-  opacity: 0.28,
-  side: THREE.DoubleSide,
-  depthWrite: false,
-});
-const wakeGeo = new THREE.RingGeometry(0.3, 0.45, 18);
-wakeGeo.rotateX(-Math.PI / 2);
-
-const wakes = [];
-for (let i = 0; i < 14; i++) {
-  const ring = new THREE.Mesh(wakeGeo, wakeMat.clone());
-  ring.visible = false;
-  ring.renderOrder = 2;
-  scene.add(ring);
-  wakes.push({ mesh: ring, life: 0 });
-}
-let wakeCursor = 0;
-let wakeTimer = 0;
-
-function spawnWake(x, z) {
-  const w = wakes[wakeCursor];
-  wakeCursor = (wakeCursor + 1) % wakes.length;
-  w.mesh.position.set(x, 0.05, z);
-  w.mesh.scale.setScalar(0.6);
-  w.mesh.visible = true;
-  w.life = 1;
+  sparkGeo.attributes.position.needsUpdate = true;
+  sparkGeo.attributes.color.needsUpdate = true;
 }
 
 /* ---------------------------- project plaques ---------------------------- */
-/* a post at the waterline with an angled board, plus a real DOM label so the
-   text stays crisp and clickable */
+/* a driftwood post up the sand with a jar of glowing algae hung on it, plus a
+   real DOM label so the text stays crisp and clickable */
 
-const postMat = new THREE.MeshStandardMaterial({ color: 0x6a4d2e, flatShading: true, roughness: 0.95 });
-const boardMat = new THREE.MeshStandardMaterial({ color: 0xd9b579, flatShading: true, roughness: 0.9 });
+const postMat = new THREE.MeshStandardMaterial({ color: 0x5c5248, flatShading: true, roughness: 1 });
+const boardMat = new THREE.MeshStandardMaterial({ color: 0x8a7d6a, flatShading: true, roughness: 0.95 });
+const glassMat = new THREE.MeshStandardMaterial({
+  color: 0x9fd8ff,
+  transparent: true,
+  opacity: 0.25,
+  roughness: 0.1,
+  depthWrite: false,
+});
 
 const signs = [];
 
 PROJECTS.forEach((project, i) => {
   const z = SIGN_FIRST_Z - i * SIGN_SPACING;
-  const side = i % 2 === 0 ? -1 : 1;
-  const x = riverCenterX(z) + side * (RIVER_HALF + 0.75);
-  const groundY = groundHeight(x, z);
-
+  const x = shoreX(z) - SIGN_S;
   const group = new THREE.Group();
-  group.position.set(x, groundY, z);
-  // face the board across the water
-  group.rotation.y = side < 0 ? Math.PI * 0.5 : -Math.PI * 0.5;
+  group.position.set(x, sandH(SIGN_S), z);
+  group.rotation.y = Math.PI * 0.5 + (hash(i, 3) - 0.5) * 0.3;   // board faces the water
 
-  const post = new THREE.Mesh(new THREE.CylinderGeometry(0.075, 0.095, 2.5, 6), postMat);
-  post.position.y = 1.1;
-  post.castShadow = true;
+  const post = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.1, 2.4, 6), postMat);
+  post.position.y = 1.05;
+  post.rotation.z = (hash(i, 1) - 0.5) * 0.12;
   group.add(post);
 
-  const board = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.6, 0.08), boardMat);
-  board.position.set(0, 2.1, 0.07);
-  board.rotation.x = -0.18;
-  board.castShadow = true;
+  const board = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.55, 0.07), boardMat);
+  board.position.set(0, 2.0, 0.07);
+  board.rotation.x = -0.15;
   group.add(board);
 
-  // little oil lamp on the post, because dusk
-  const lamp = new THREE.Mesh(
-    new THREE.IcosahedronGeometry(0.09, 0),
-    new THREE.MeshBasicMaterial({ color: 0xffca7a })
+  const jar = new THREE.Group();
+  jar.position.set(0.5, 1.45, 0.14);
+  const algae = new THREE.Mesh(
+    new THREE.IcosahedronGeometry(0.075, 1),
+    new THREE.MeshBasicMaterial({ color: new THREE.Color(0.2, 1.4, 3.0) })
   );
-  lamp.position.set(0.55, 1.6, 0.1);
-  group.add(lamp);
+  algae.position.y = -0.03;
+  jar.add(algae);
+  jar.add(new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 0.22, 8), glassMat));
+  group.add(jar);
 
   const wrapper = document.createElement('div');
   const isLink = Boolean(project.url);
   const el = document.createElement(isLink ? 'a' : 'span');
-  el.className = 'sign-label bank' + (isLink ? '' : ' placeholder');
+  el.className = 'sign-label shore' + (isLink ? '' : ' placeholder');
   if (isLink) {
     el.href = project.url;
     el.target = '_blank';
@@ -1271,132 +969,147 @@ PROJECTS.forEach((project, i) => {
   el.style.pointerEvents = 'auto';
 
   const nameEl = document.createElement('span');
-  nameEl.className = 'bank-name';
+  nameEl.className = 'shore-name';
   nameEl.textContent = project.name;
   el.appendChild(nameEl);
 
   if (project.note) {
     const noteEl = document.createElement('span');
-    noteEl.className = 'bank-note';
+    noteEl.className = 'shore-note';
     noteEl.textContent = project.note;
     el.appendChild(noteEl);
   }
   wrapper.appendChild(el);
 
   const label = new CSS2DObject(wrapper);
-  label.position.set(0, 3.0, 0);
+  label.position.set(0, 2.85, 0);
   group.add(label);
 
   scene.add(group);
-  signs.push({ group, wrapper, el, z, x, lamp, index: i });
+  signs.push({ group, wrapper, el, z, algae, phase: hash(i, 8) * 6 });
 });
 
-/* ------------------------------ boat motion ------------------------------ */
+/* ------------------------------ walking ------------------------------ */
 
-const DRIFT_SPEED = 1.55;
-const GLIDE_SPEED = 13;
+const WALK_SPEED = 1.15;
+const GLIDE_SPEED = 6.5;      // a trot, when skipping between plaques
+const STRIDE = 6.4;           // radians of walk cycle per unit travelled
 
 const trip = {
   z: Z_START,
-  drifting: true,
+  walking: true,
   glideTo: null,
+  phase: 0,
+  stride: 0,           // eases in and out, so stopping isn't a freeze-frame
+  lastSin: 0,
+  stepCursor: 0,
 };
-
-// Everything that drifts falls behind over a trip. Redistribute it while the
-// screen is faded out, otherwise the next run starts in empty water.
-function reseedDrifters() {
-  const anywhere = (from) => from - Math.random() * (from - SCATTER_END);
-  for (const f of floaters) {
-    f.userData.z = anywhere(Z_START + 12);
-    f.userData.u = f.userData.restU;
-  }
-  for (const duck of ducks) {
-    duck.userData.z = anywhere(Z_START + 8);
-    duck.userData.u = duck.userData.restU;
-    duck.userData.vLat = 0;
-  }
-  for (const fish of fishes) {
-    fish.userData.z = anywhere(Z_START + 10);
-    fish.userData.state = 'swim';
-    fish.userData.timer = 2 + Math.random() * 8;
-  }
-}
-
-function boatPathAt(z) {
-  return new THREE.Vector3(riverCenterX(z), 0, z);
-}
 
 const fade = document.getElementById('wrap-fade');
 let fadeAmount = 0;
 let pendingWrap = false;
 
-function updateBoat(dt, t) {
+function forgetFootprints() {
+  for (const st of stepUniforms) st.z = -1000;
+}
+
+function placeFootprint(x, z, t) {
+  const st = stepUniforms[trip.stepCursor];
+  trip.stepCursor = (trip.stepCursor + 1) % STEPS;
+  st.set(x, z, t, 0);
+}
+
+function updateCat(dt, t) {
+  const before = trip.z;
   if (trip.glideTo !== null) {
     const diff = trip.glideTo - trip.z;
-    const step = Math.sign(diff) * Math.min(Math.abs(diff), GLIDE_SPEED * dt);
+    const ease = Math.min(1, Math.abs(diff) / 2.5);   // slow to a walk on arrival
+    const step = Math.sign(diff) * Math.min(Math.abs(diff), GLIDE_SPEED * Math.max(ease, 0.2) * dt);
     trip.z += step;
-    if (Math.abs(diff) < 0.15) {
+    if (Math.abs(diff) < 0.05) {
       trip.z = trip.glideTo;
       trip.glideTo = null;
     }
-  } else if (trip.drifting) {
-    trip.z -= DRIFT_SPEED * dt;
+  } else if (trip.walking) {
+    trip.z -= WALK_SPEED * dt;
   }
+  const moved = Math.abs(trip.z - before);
+  const goingBack = trip.z > before;
 
-  // loop the journey behind a short fade instead of snapping
+  // loop the walk behind a short fade instead of snapping
   if (trip.z < Z_END && !pendingWrap) pendingWrap = true;
-
   if (pendingWrap) {
-    fadeAmount = Math.min(1, fadeAmount + dt * 1.8);
+    fadeAmount = Math.min(1, fadeAmount + dt * 1.6);
     if (fadeAmount >= 1) {
       trip.z = Z_START;
       pendingWrap = false;
-      reseedDrifters();
+      forgetFootprints();
     }
   } else if (fadeAmount > 0) {
-    fadeAmount = Math.max(0, fadeAmount - dt * 1.3);
+    fadeAmount = Math.max(0, fadeAmount - dt * 1.2);
   }
   if (fade) fade.style.opacity = String(fadeAmount);
 
-  const here = boatPathAt(trip.z);
-  const ahead = boatPathAt(trip.z - 2.5);
-  const dir = ahead.clone().sub(here);
+  const here = walkPathAt(trip.z);
+  const heading = headingAt(trip.z) + (goingBack ? Math.PI : 0);
 
-  const bobY = Math.sin(t * 1.1) * 0.045 + Math.sin(t * 1.9 + 1.2) * 0.025;
-  boat.position.set(here.x, 0.3 + bobY, here.z);
-  boat.rotation.y = Math.atan2(dir.x, dir.z);
-  boat.rotation.z = Math.sin(t * 0.85) * 0.035;
-  boat.rotation.x = Math.sin(t * 1.35 + 0.6) * 0.02;
+  trip.stride = THREE.MathUtils.lerp(trip.stride, moved > 1e-4 ? 1 : 0, Math.min(1, dt * 5));
+  trip.phase += moved * STRIDE;
+  const sw = Math.sin(trip.phase);
+  const swing = sw * 0.5 * trip.stride;
+  const { legs } = cat.userData;
+  legs[0].rotation.x = swing;    // front-left
+  legs[3].rotation.x = swing;    // back-right
+  legs[1].rotation.x = -swing;   // front-right
+  legs[2].rotation.x = -swing;   // back-left
+  cat.userData.tailPivot.rotation.y = Math.sin(t * (trip.stride > 0.5 ? 6 : 2)) * 0.35;
+  cat.userData.head.rotation.y = Math.sin(t * 0.7) * 0.12;
 
-  // poling: a slow push, then a recovery
-  const stroke = (t * 0.55) % 1;
-  const push = Math.sin(stroke * Math.PI * 2);
-  boat.userData.polePivot.rotation.x = 0.5 + push * 0.42;
-  boat.userData.polePivot.rotation.z = 0.2 + push * 0.07;
-  for (const arm of boat.userData.arms) arm.rotation.x = -0.6 + push * 0.45;
-  boat.userData.man.rotation.y = Math.sin(t * 0.55 * Math.PI * 2) * 0.12;
-  boat.userData.lantern.intensity = 2.2 + Math.sin(t * 7.3) * 0.25;
+  cat.position.copy(here);
+  cat.position.y += Math.abs(Math.cos(trip.phase)) * 0.015 * trip.stride;
+  cat.rotation.y = lerpAngle(cat.rotation.y, heading, Math.min(1, dt * 6));
+
+  // a diagonal pair of paws lands each time the legs pass each other
+  const edge = waterEdgeAt(trip.z, t);
+  const inWater = edge > WALK_S;
+  if (moved > 1e-4 && Math.sign(sw) !== Math.sign(trip.lastSin)) {
+    const pair = sw > 0 ? [[-PAW_X, PAW_Z], [PAW_X, -PAW_Z]] : [[PAW_X, PAW_Z], [-PAW_X, -PAW_Z]];
+    const fx = Math.sin(heading);
+    const fz = Math.cos(heading);
+    for (const [lx, lz] of pair) {
+      // local +X is (fz, -fx) once turned to the heading
+      const px = here.x + fz * lx + fx * lz;
+      const pz = here.z - fx * lx + fz * lz;
+      placeFootprint(px, pz, t);
+      kickSparks(px, pz, inWater ? 9 : 2, inWater ? 0.7 : 0.35);
+    }
+  }
+  trip.lastSin = sw;
+
+  // light the cat from below, harder when the swash is round its paws
+  const pawDeep = THREE.MathUtils.clamp((edge - WALK_S) / 1.2, 0, 1);
+  footGlow.position.set(here.x, here.y + 0.05, here.z);
+  footGlow.intensity = THREE.MathUtils.lerp(footGlow.intensity, 0.4 + pawDeep * 1.6, Math.min(1, dt * 4));
 
   return here;
 }
 
 /* ---------------------------- plaque visibility ---------------------------- */
-/* only show the plaques we are actually near — keeps the DOM quiet and lets
-   them emerge out of the haze as the boat comes round */
 
-function updateSigns(boatZ) {
+function updateSigns(catZ, t) {
   for (const sign of signs) {
-    const dz = sign.z - boatZ;          // negative = already passed
+    const dz = sign.z - catZ;          // positive = already passed
     let opacity = 0;
-    if (dz < 10 && dz > -22) {
-      opacity = THREE.MathUtils.clamp((22 + dz) / 6, 0, 1) * THREE.MathUtils.clamp((10 - dz) / 8, 0, 1);
+    if (dz < 10 && dz > -24) {
+      opacity = THREE.MathUtils.clamp((24 + dz) / 7, 0, 1) * THREE.MathUtils.clamp((10 - dz) / 7, 0, 1);
     }
     sign.wrapper.style.opacity = opacity.toFixed(3);
     sign.wrapper.style.display = opacity < 0.02 ? 'none' : '';
 
-    const near = dz > -12 && dz < 6;
+    const near = dz > -10 && dz < 5;
     sign.el.classList.toggle('active', near);
-    sign.lamp.material.color.setHex(near ? 0xfff0bb : 0xffca7a);
+    const pulse = (near ? 1.3 : 0.8) + Math.sin(t * 1.7 + sign.phase) * 0.25;
+    sign.algae.material.color.setRGB(0.2 * pulse, 1.4 * pulse, 3.0 * pulse);
   }
 }
 
@@ -1406,16 +1119,16 @@ const playBtn = document.getElementById('nav-play');
 const prevBtn = document.getElementById('nav-prev');
 const nextBtn = document.getElementById('nav-next');
 
-function setDrifting(on) {
-  trip.drifting = on;
+function setWalking(on) {
+  trip.walking = on;
   if (playBtn) {
     playBtn.textContent = on ? '❙❙' : '▶';
-    playBtn.setAttribute('aria-label', on ? 'pause the drift' : 'resume the drift');
+    playBtn.setAttribute('aria-label', on ? 'pause the walk' : 'keep walking');
   }
 }
 
 function goToSign(step) {
-  // where the boat should sit to be level with a plaque
+  // where the cat should stop to be level with a plaque
   const stops = signs.map((s) => s.z + 1.5);
   let idx = 0;
   let best = Infinity;
@@ -1426,14 +1139,13 @@ function goToSign(step) {
       idx = i;
     }
   });
-  // if we're already basically at that stop, move on to the neighbour
   if (best < 2.5 || Math.sign(stops[idx] - trip.z) !== Math.sign(-step)) idx += step;
   idx = THREE.MathUtils.clamp(idx, 0, stops.length - 1);
   trip.glideTo = stops[idx];
   hint.style.opacity = '0';
 }
 
-if (playBtn) playBtn.addEventListener('click', () => setDrifting(!trip.drifting));
+if (playBtn) playBtn.addEventListener('click', () => setWalking(!trip.walking));
 if (prevBtn) prevBtn.addEventListener('click', () => goToSign(-1));
 if (nextBtn) nextBtn.addEventListener('click', () => goToSign(1));
 
@@ -1442,21 +1154,21 @@ window.addEventListener('keydown', (e) => {
   else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') goToSign(-1);
   else if (e.key === ' ') {
     e.preventDefault();
-    setDrifting(!trip.drifting);
+    setWalking(!trip.walking);
   }
 });
 
-setDrifting(true);
+setWalking(true);
 
 /* ------------------------------- camera ------------------------------- */
-/* the camera rides behind the boat. OrbitControls still owns the offset, so
-   dragging works — we just translate target and camera by the same delta. */
+/* the camera follows behind the cat. OrbitControls still owns the offset,
+   so dragging works — we just translate target and camera by the same delta. */
 
-const camTarget = new THREE.Vector3(riverCenterX(Z_START), CAM_LOOK_Y, Z_START);
+const camTarget = controls.target.clone();
 const idealOffset = new THREE.Vector3();
 
-function updateCamera(dt, boatPos, heading, t) {
-  const desired = boatPos.clone();
+function updateCamera(dt, pos, heading, t) {
+  const desired = pos.clone();
   desired.y += CAM_LOOK_Y;
 
   const delta = desired.clone().sub(camTarget);
@@ -1465,10 +1177,9 @@ function updateCamera(dt, boatPos, heading, t) {
   camera.position.add(delta);
 
   if (!userInteracted) {
-    // gentle cinematic framing: trailing, a touch off to one side, breathing
     idealOffset.set(
-      CAM_OFFSET.x + Math.sin(t * 0.13) * 1.4,
-      CAM_OFFSET.y + Math.sin(t * 0.09) * 0.3,
+      CAM_OFFSET.x + Math.sin(t * 0.11) * 1.3,
+      CAM_OFFSET.y + Math.sin(t * 0.08) * 0.35,
       CAM_OFFSET.z
     );
     idealOffset.applyAxisAngle(UP, heading);
@@ -1483,156 +1194,54 @@ function onResize() {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  composer.setSize(window.innerWidth, window.innerHeight);
   labelRenderer.setSize(window.innerWidth, window.innerHeight);
 }
 window.addEventListener('resize', onResize);
 
-const sunWorld = new THREE.Vector3();
+function render() {
+  composer.render();
+  labelRenderer.render(scene, camera);
+}
 
 function animate() {
   const dt = Math.min(clock.getDelta(), 0.1);
   const t = clock.elapsedTime;
 
-  const boatPos = updateBoat(dt, t);
-  updateCamera(dt, boatPos, boat.rotation.y, t);
-  updateWater(t, boatPos.x, boatPos.z);
-  updateSigns(trip.z);
+  const pos = updateCat(dt, t);
+  updateCamera(dt, pos, headingAt(trip.z), t);
+  updateSigns(trip.z, t);
+  updateSparks(dt);
+  updateBoats(dt, t, trip.z);
 
-  // sky and sun sit at infinity: pin them to the camera
+  placeBeach(trip.z);
+  beachMat.uniforms.uTime.value = t;
+  beachMat.uniforms.uCat.value.set(pos.x, pos.z);
+  skyMat.uniforms.uTime.value = t;
+
+  // sky and far land sit at infinity: pin them to the camera
   sky.position.copy(camera.position);
-  sunWorld.copy(camera.position).addScaledVector(SUN_DIR, 240);
-  sunGroup.position.copy(sunWorld);
-  sunGroup.lookAt(camera.position);
-  skyMat.uniforms.sunDir.value.copy(SUN_DIR);
+  headlands.position.set(0, 0, trip.z);
 
-  // keep the shadow frustum around the boat
-  sun.target.position.copy(boatPos);
-  sun.position.copy(boatPos).addScaledVector(SUN_DIR, -26);
-  sun.position.y = boatPos.y + 13;
+  moonLight.target.position.copy(pos);
+  moonLight.position.copy(pos).addScaledVector(MOON_DIR, 30);
 
-  // palms in the evening breeze
+  // palms in the night breeze
   for (const palm of palms) {
-    const sway = Math.sin(t * 0.55 + palm.userData.swayPhase) * 0.045;
+    const sway = Math.sin(t * 0.5 + palm.userData.swayPhase) * 0.04;
     palm.userData.crown.rotation.z = palm.userData.crownRestZ + sway;
     palm.userData.crown.rotation.y = sway * 0.6;
   }
 
-  for (const reed of reeds) {
-    reed.rotation.z = Math.sin(t * 1.4 + reed.userData.phase) * 0.12;
-  }
-
-  // floating things bob and drift downstream, recycling at the far end
-  for (const f of floaters) {
-    const d = f.userData;
-    d.z -= dt * 0.22;
-    if (d.z > trip.z + 55 || d.z < trip.z - 155) {
-      d.z = trip.z - 95 - Math.random() * 45;   // back into the haze ahead
-      d.u = d.restU;
-    }
-
-    // the rafts don't flee, the bow wave just pushes them aside
-    const shove = 1 - Math.min(1, Math.abs(d.z - trip.z) / 5);
-    const clearU = Math.max(Math.abs(d.restU), 1.85 / RIVER_HALF);
-    const targetU = THREE.MathUtils.lerp(d.restU, d.side * Math.min(0.96, clearU), shove);
-    d.u = THREE.MathUtils.lerp(d.u, targetU, Math.min(1, dt * (0.5 + shove * 4)));
-
-    const u = d.u + Math.sin(t * 0.25 + d.phase) * 0.04;
-    f.position.set(
-      riverCenterX(d.z) + u * RIVER_HALF,
-      0.02 + Math.sin(t * 1.3 + d.phase) * 0.03,
-      d.z
-    );
-    f.rotation.y = Math.sin(t * 0.18 + d.phase) * 0.5 + shove * d.side * 0.45;
-  }
-
-  for (const duck of ducks) {
-    const d = duck.userData;
-    // 0 when the boat is far off, 1 when it is right alongside
-    const alarm = 1 - Math.min(1, Math.abs(d.z - trip.z) / DUCK_ALERT_Z);
-
-    const fwd = d.rate + alarm * 0.95;   // a spurt while it gets out of the way
-    d.z -= dt * fwd;
-    if (d.z > trip.z + 55 || d.z < trip.z - 155) {
-      d.z = trip.z - 95 - Math.random() * 45;
-      d.u = d.restU;
-      d.vLat = 0;
-    }
-
-    // hold a lane normally; swing wide enough to clear the hull when alarmed
-    const clearU = Math.max(Math.abs(d.restU), BOAT_CLEAR / DUCK_LANE);
-    const targetU = THREE.MathUtils.lerp(
-      d.restU,
-      d.side * Math.min(0.95, clearU + alarm * 0.18),
-      alarm
-    );
-    // bolts away quickly, wanders back at its leisure
-    const pull = 0.9 + alarm * 5.5;
-    d.u = THREE.MathUtils.lerp(d.u, targetU, Math.min(1, dt * pull));
-
-    // Accumulate the paddling phase. Writing sin(t * freq) with a freq that
-    // changes each frame jumps the argument by tens of radians and the duck
-    // buzzes; integrating the frequency keeps it continuous.
-    d.bobPhase += dt * (2.2 + alarm * 4);
-
-    const u = d.u + Math.sin(t * 0.4 + d.phase) * 0.06 * (1 - alarm);
-    duck.position.set(
-      riverCenterX(d.z) + u * DUCK_LANE,
-      0.09 + Math.sin(d.bobPhase) * 0.03,
-      d.z
-    );
-
-    // Lateral speed taken from how far it still has to go, not from
-    // differencing successive positions — a numerical derivative of a lerp
-    // spikes whenever the frame time wobbles, which showed up as rocking.
-    const latV = (targetU - d.u) * DUCK_LANE * pull;
-    d.vLat += (latV - d.vLat) * Math.min(1, dt * 5);
-    duck.rotation.y = Math.atan2(d.vLat, -fwd);
-    const roll = Math.abs(d.vLat) < 0.05 ? 0 : d.vLat;
-    duck.rotation.z = -THREE.MathUtils.clamp(roll * 0.1, -0.28, 0.28);
-  }
-
-  updateFish(dt, t);
-
-  for (const bird of birds) {
-    const a = t * bird.userData.speed + bird.userData.phase;
-    bird.position.set(
-      Math.cos(a) * bird.userData.radius,
-      bird.userData.height + Math.sin(a * 2.1) * 1.4,
-      bird.userData.zBase + Math.sin(a) * bird.userData.radius * 0.5
-    );
-    bird.rotation.y = -a + Math.PI / 2;
-    const flap = Math.sin(t * 7 + bird.userData.phase) * 0.5;
-    bird.userData.wings[0].rotation.z = flap;
-    bird.userData.wings[1].rotation.z = -flap;
-  }
-
-  // wake rings off the prow
-  wakeTimer -= dt;
-  if (wakeTimer <= 0 && (trip.drifting || trip.glideTo !== null)) {
-    wakeTimer = 0.42;
-    const prow = boatPathAt(trip.z - 3.2);
-    spawnWake(prow.x, prow.z);
-  }
-  for (const w of wakes) {
-    if (w.life <= 0) continue;
-    w.life -= dt * 0.45;
-    if (w.life <= 0) {
-      w.mesh.visible = false;
-      continue;
-    }
-    w.mesh.scale.setScalar(0.6 + (1 - w.life) * 2.6);
-    w.mesh.material.opacity = w.life * 0.26;
-  }
-
   controls.update();
-  renderer.render(scene, camera);
-  labelRenderer.render(scene, camera);
+  render();
   requestAnimationFrame(animate);
 }
 
-updateWater(0, riverCenterX(Z_START), Z_START);
-renderer.render(scene, camera);
-labelRenderer.render(scene, camera);
+placeBeach(Z_START);
+cat.position.copy(walkPathAt(Z_START));
+cat.rotation.y = headingAt(Z_START);
+render();
 document.getElementById('loading').classList.add('hidden');
 animate();
 
